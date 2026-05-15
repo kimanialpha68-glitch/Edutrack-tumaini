@@ -694,7 +694,7 @@ function saveSyncConfig(cfg){
 }
 
 // Keys that are saved/restored during cloud sync
-const SYNC_KEYS = ['students','fees','inventory','vehicles','routes','fueling','repairs','alumni','exams','messages'];
+const SYNC_KEYS = ['students','fees','inventory','vehicles','routes','fueling','repairs','alumni','exams','messages','atConfig'];
 
 async function cloudPush(data, cfg){
   if(!cfg.proxyUrl||!cfg.syncSecret) return {ok:false,error:'Sync not configured'};
@@ -877,13 +877,15 @@ function App({ session, onLogout }) {
   const [syncMsg,    setSyncMsg]    = useState('');
   const [lastSync,   setLastSync]   = useState(()=>localStorage.getItem('edutrack_last_sync')||null);
   const syncTimer = React.useRef(null);
+  const wsRef     = React.useRef(null);
+  const wsRetry   = React.useRef(null);
 
   const updateSyncConfig = (cfg) => { saveSyncConfig(cfg); setSyncConfigState(cfg); };
 
   // Collect all current data into one object
   const collectData = React.useCallback(()=>({
-    students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages
-  }),[students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
+    students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages, atConfig
+  }),[students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages, atConfig]);
 
   // Debounced auto-push — fires 3s after last change
   const schedulePush = React.useCallback(()=>{
@@ -927,6 +929,7 @@ function App({ session, onLogout }) {
         if(d.alumni)      setAlumni(d.alumni);
         if(d.exams)       setExams(d.exams);
         if(d.messages)    setMessages(d.messages);
+        if(d.atConfig)    setAtConfig(d.atConfig);
         setSyncStatus('ok');
         const ts = new Date().toLocaleString();
         setSyncMsg(`Loaded from cloud ${ts}`);
@@ -938,6 +941,70 @@ function App({ session, onLogout }) {
     })();
   // eslint-disable-next-line
   },[]);
+
+  // ── WebSocket — real-time sync from other devices ──────────────────────
+  React.useEffect(()=>{
+    if(!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
+
+    function applyRemoteData(d){
+      if(d.students)  setStudents(d.students);
+      if(d.fees)      setFees(d.fees);
+      if(d.inventory) setInventory(d.inventory);
+      if(d.vehicles)  setVehicles(d.vehicles);
+      if(d.routes)    setRoutes(d.routes);
+      if(d.fueling)   setFueling(d.fueling);
+      if(d.repairs)   setRepairs(d.repairs);
+      if(d.alumni)    setAlumni(d.alumni);
+      if(d.exams)     setExams(d.exams);
+      if(d.messages)  setMessages(d.messages);
+      if(d.atConfig)  setAtConfig(d.atConfig);
+      const ts = new Date().toLocaleString();
+      setLastSync(ts);
+      localStorage.setItem('edutrack_last_sync', ts);
+    }
+
+    function connect(){
+      const base  = syncConfig.proxyUrl.replace(/^http/, 'ws');
+      const wsUrl = base + '/?secret=' + encodeURIComponent(syncConfig.syncSecret);
+      const ws    = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('[WS] Connected — real-time sync active');
+        setSyncMsg('Live sync active ✅');
+      };
+
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if((msg.type === 'snapshot' || msg.type === 'update') && msg.data){
+            applyRemoteData(msg.data);
+            if(msg.type === 'update'){
+              setSyncStatus('ok');
+              setSyncMsg('Updated from another device ' + new Date().toLocaleTimeString());
+              showToast('🔄 Data updated from another device');
+            }
+          }
+        } catch(e){}
+      };
+
+      ws.onclose = () => {
+        console.log('[WS] Disconnected — retrying in 5s');
+        wsRetry.current = setTimeout(connect, 5000);
+      };
+
+      ws.onerror = () => ws.close();
+    }
+
+    connect();
+
+    return () => {
+      clearTimeout(wsRetry.current);
+      if(wsRef.current) wsRef.current.close();
+    };
+  // eslint-disable-next-line
+  },[syncConfig.proxyUrl, syncConfig.syncSecret]);
+  // ────────────────────────────────────────────────────────────────────────
 
   const manualPush = async()=>{
     setSyncStatus('syncing');
@@ -961,6 +1028,7 @@ function App({ session, onLogout }) {
       if(d.alumni)    setAlumni(d.alumni);
       if(d.exams)     setExams(d.exams);
       if(d.messages)  setMessages(d.messages);
+      if(d.atConfig)  setAtConfig(d.atConfig);
       setSyncStatus('ok'); const ts=new Date().toLocaleString(); setSyncMsg(`Loaded from cloud ${ts}`); setLastSync(ts); localStorage.setItem('edutrack_last_sync',ts); showToast('☁️ Data loaded from cloud!');
     } else { setSyncStatus('error'); setSyncMsg(result.error); showToast('Pull failed: '+result.error,'rose'); }
   };
