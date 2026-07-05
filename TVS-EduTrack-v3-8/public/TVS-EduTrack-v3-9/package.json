@@ -1,0 +1,17 @@
+{
+  "name": "edutrack",
+  "version": "4.0.0",
+  "description": "TVS EduTrack — School Management System",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "engines": { "node": ">=18.0.0" },
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "mongodb": "^6.3.0",
+    "node-fetch": "^2.7.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.17.1"
+  }
+}
