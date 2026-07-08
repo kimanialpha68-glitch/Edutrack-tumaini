@@ -1647,7 +1647,7 @@ function App({
         setSyncStatus('error');
         setSyncMsg(result.error || 'Sync failed');
       }
-    }, 3000);
+    }, 1500);
   }, [syncConfig, collectData]);
 
   // Immediate push — used for destructive operations (delete, clear)
@@ -4891,7 +4891,9 @@ function Students({
   };
   const del = id => {
     if (!confirm('Permanently remove this student?')) return;
-    setStudents(p => p.filter(s => s.id !== id));
+    const ns = students.filter(s => s.id !== id);
+    setStudents(() => ns);
+    schedulePush();
     setViewId(null);
     showToast('Student removed', 'rose');
   };
@@ -6730,7 +6732,9 @@ function Students({
         className: "btn btn-rose btn-sm",
         onClick: () => {
           if (confirm('Delete this payment record?')) {
-            setFees(p => p.filter(x => x.id !== f.id));
+            const newFees = fees.filter(x => x.id !== f.id);
+            setFees(() => newFees);
+            schedulePush();
             showToast('Payment deleted', 'rose');
           }
         }
@@ -7345,8 +7349,8 @@ function Fees({
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Student"), /*#__PURE__*/React.createElement("th", null, "Term"), /*#__PURE__*/React.createElement("th", null, "Expected"), /*#__PURE__*/React.createElement("th", null, "Paid"), /*#__PURE__*/React.createElement("th", null, "Balance"), /*#__PURE__*/React.createElement("th", null, "Method"), /*#__PURE__*/React.createElement("th", null, "Date"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", null, "Receipt"))), /*#__PURE__*/React.createElement("tbody", null, filtered.map(f => {
     const s = students.find(st => st.id === f.studentId);
     const bal = f.amount - f.paid;
-    return /*#__PURE__*/React.createElement("tr", {
-      key: f.id
+    return /*#__PURE__*/React.createElement(React.Fragment, {key: f.id},
+    /*#__PURE__*/React.createElement("tr", {
     }, /*#__PURE__*/React.createElement("td", {
       className: "fw6"
     }, s?.name || 'Unknown', /*#__PURE__*/React.createElement("div", {
@@ -7382,19 +7386,22 @@ function Fees({
       title: "Delete",
       onClick: () => {
         if (confirm('Delete this payment record?')) {
-          setFees(p => p.filter(x => x.id !== f.id));
+          const newFees = fees.filter(x => x.id !== f.id);
+          setFees(() => newFees);
+          schedulePush();
           showToast('Payment deleted', 'rose');
         }
       }
     }, "\uD83D\uDDD1")))),
-    f.paymentHistory && f.paymentHistory.length > 1 && /*#__PURE__*/React.createElement("tr", { key: f.id + '_hist', style: { background: 'rgba(0,0,0,0.2)' } },
+    f.paymentHistory && f.paymentHistory.length > 1 && /*#__PURE__*/React.createElement("tr", { style: { background: 'rgba(0,0,0,0.2)' } },
       /*#__PURE__*/React.createElement("td", { colSpan: 9, style: { padding: '6px 12px' } },
         /*#__PURE__*/React.createElement("div", { style: { fontSize: '0.7rem', color: 'var(--gold)', fontWeight: 700, marginBottom: 4 } }, `📋 ${f.paymentHistory.length} instalments:`),
         f.paymentHistory.map((p, i) => /*#__PURE__*/React.createElement("span", { key: i, style: { marginRight: 16, color: 'var(--text2)', fontSize: '0.7rem' } },
           `${i+1}. KES ${parseFloat(p.amount).toLocaleString()} via ${p.method || '—'}${p.date ? ' on ' + fmtDate(p.date) : ''}${p.ref ? ' ('+p.ref+')' : ''}`
         ))
       )
-    );
+    )
+  );
   }))))), /*#__PURE__*/React.createElement("div", {
     className: "m-card-list"
   }, filtered.map(f => {
@@ -7444,7 +7451,9 @@ function Fees({
       className: "btn btn-rose btn-sm",
       onClick: () => {
         if (confirm('Delete this payment record?')) {
-          setFees(p => p.filter(x => x.id !== f.id));
+          const nf = fees.filter(x => x.id !== f.id);
+          setFees(() => nf);
+          schedulePush();
           showToast('Payment deleted', 'rose');
         }
       }
@@ -8288,7 +8297,9 @@ function Vehicles({
   };
   const del = id => {
     if (!confirm('Remove this vehicle?')) return;
-    setVehicles(p => p.filter(v => v.id !== id));
+    const nv = vehicles.filter(v => v.id !== id);
+    setVehicles(() => nv);
+    schedulePush();
     setViewId(null);
     showToast('Vehicle removed', 'rose');
   };
