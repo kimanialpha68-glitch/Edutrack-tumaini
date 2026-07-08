@@ -58,6 +58,44 @@
     --bottombar-h: 64px;
   }
 
+  /* ── LIGHT MODE ── */
+  [data-theme="light"] {
+    --navy:   #f0f4f8;
+    --navy2:  #e2e8f0;
+    --navy3:  #d1dbe8;
+    --slate:  #b8c8d8;
+    --gold:   #c47a00;
+    --gold2:  #e09000;
+    --teal:   #008a7a;
+    --rose:   #c94055;
+    --green:  #18a867;
+    --purple: #6244a8;
+    --text:   #0f1b2d;
+    --text2:  #4a6080;
+    --border: #c5d3e0;
+    --card:   #ffffff;
+    --input:  #f0f4f8;
+    --shadow: 0 4px 24px rgba(0,0,0,0.10);
+  }
+
+  /* Light mode specific overrides */
+  [data-theme="light"] body { background: #f0f4f8; }
+  [data-theme="light"] .sidebar { background: #ffffff; box-shadow: 2px 0 12px rgba(0,0,0,0.08); }
+  [data-theme="light"] .topbar { background: #ffffff; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+  [data-theme="light"] .bottombar { background: #ffffff; box-shadow: 0 -2px 8px rgba(0,0,0,0.08); }
+  [data-theme="light"] .card { background: #ffffff; border-color: #d1dbe8; }
+  [data-theme="light"] input, [data-theme="light"] select, [data-theme="light"] textarea {
+    background: #ffffff !important; color: #0f1b2d !important; border-color: #c5d3e0 !important;
+  }
+  [data-theme="light"] table th { background: #e2e8f0; color: #0f1b2d; }
+  [data-theme="light"] table tr:hover { background: rgba(0,0,0,0.03); }
+  [data-theme="light"] .modal-overlay { background: rgba(0,0,0,0.4); }
+  [data-theme="light"] .modal { background: #ffffff; }
+  [data-theme="light"] .badge { filter: brightness(0.9); }
+  [data-theme="light"] .nav-item:hover, [data-theme="light"] .nav-item.active { background: rgba(0,0,0,0.06); }
+  [data-theme="light"] .stat-card { background: #ffffff; }
+  [data-theme="light"] .m-card-item { background: #ffffff; border-color: #d1dbe8; }
+
   *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html { font-size:16px; }
   body {
@@ -1425,6 +1463,15 @@ function urlBase64ToUint8Array(base64String) {
 
 function Root() {
   const [session, setSession] = useState(() => loadSession());
+  const [theme, setTheme] = useState(() => localStorage.getItem('tvs_theme') || 'dark');
+
+  // Apply theme to document
+  React.useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('tvs_theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
   const handleLogin = s => {
     setSession(s);
     // Auto-pull from cloud immediately after login on any device
@@ -1465,14 +1512,18 @@ function Root() {
   });
   return /*#__PURE__*/React.createElement(App, {
     session: session,
-    onLogout: handleLogout
+    onLogout: handleLogout,
+    theme: theme,
+    toggleTheme: toggleTheme
   });
 }
 
 // ──────────── APP ────────────
 function App({
   session,
-  onLogout
+  onLogout,
+  theme,
+  toggleTheme
 }) {
   const [page, setPage] = useState('dashboard');
   const [students, setStudents] = usePersist('students', initStudents);
@@ -2200,7 +2251,25 @@ function App({
       transition: 'all .2s',
       whiteSpace: 'nowrap'
     }
-  }, "\u23CF Sign out"))), /*#__PURE__*/React.createElement("div", {
+  }, "\u23CF Sign out"),
+  /*#__PURE__*/React.createElement("button", {
+    onClick: toggleTheme,
+    title: theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode',
+    style: {
+      background: theme === 'dark' ? 'rgba(240,165,0,0.1)' : 'rgba(15,27,45,0.1)',
+      border: '1px solid ' + (theme === 'dark' ? 'rgba(240,165,0,0.3)' : 'rgba(15,27,45,0.2)'),
+      color: theme === 'dark' ? 'var(--gold)' : 'var(--text)',
+      borderRadius: 8,
+      padding: '5px 10px',
+      cursor: 'pointer',
+      fontSize: '1rem',
+      fontWeight: 600,
+      transition: 'all .2s',
+      whiteSpace: 'nowrap',
+      marginRight: 4
+    }
+  }, theme === 'dark' ? '☀️' : '🌙')
+  )), /*#__PURE__*/React.createElement("div", {
     className: "content"
   }, page === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
     students: activeStudents,
