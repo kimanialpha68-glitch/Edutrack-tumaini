@@ -5,7 +5,7 @@
  * Required env vars on Render:
  *   MONGODB_URI        — MongoDB Atlas connection string
  *   SYNC_SECRET        — Any password to protect sync
- *   ANTHROPIC_API_KEY  — Claude AI (for AI Message Composer)
+ *   GEMINI_API_KEY     — Google Gemini AI (for AI Message Composer)
  *   VAPID_PUBLIC_KEY   — BGrDmvlq-4UdRe3KciNtSC18JvoHFju-KgzzwAkFwUBrNBIafyrYLf9Yx1Vnd4NLQjmHUiov6aTbiPM8VY8y2Tg
  *   VAPID_PRIVATE_KEY  — q8t553rfS570qzHGnxpCppaFSPpKWgttXaqe503QGUs
  *   ADMIN_PHONE        — e.g. 254725347495 (no + or spaces)
@@ -13,6 +13,7 @@
 
 const express  = require('express');
 const cors     = require('cors');
+const compression = require('compression');
 const fetch    = require('node-fetch');
 const path     = require('path');
 const http     = require('http');
@@ -22,12 +23,12 @@ const { MongoClient }     = require('mongodb');
 
 const app    = express();
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server });
+const wss    = new WebSocketServer({ server, perMessageDeflate: true });
 
 const PORT          = process.env.PORT              || 3000;
 const MONGO_URI     = process.env.MONGODB_URI       || null;
 const SYNC_SECRET   = process.env.SYNC_SECRET       || 'edutrack-sync';
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || null;
+const GEMINI_KEY = process.env.GEMINI_API_KEY || null;
 const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || null;
 
@@ -62,6 +63,7 @@ async function connectMongo() {
 connectMongo();
 
 app.use(cors({ origin: '*' }));
+app.use(compression()); // gzip all JSON/static responses — biggest single lever on bandwidth
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -198,7 +200,7 @@ function startAlertScheduler() {
 app.get('/api/ping', (req, res) => res.json({
   ok: true, message: 'TVS EduTrack online ✅',
   sync:     db            ? 'mongodb ✅'       : 'disabled ⚠️',
-  ai:       ANTHROPIC_KEY ? 'enabled ✅'        : 'disabled ⚠️',
+  ai:       GEMINI_KEY ? 'enabled ✅ (Gemini)' : 'disabled ⚠️ (set GEMINI_API_KEY)',
   push:     VAPID_PUBLIC  ? 'enabled ✅'        : 'disabled ⚠️',
   adminSMS: adminPhone    ? `+${adminPhone} ✅` : 'not set ⚠️',
   ws:       `${clients.size} connected`,
@@ -299,23 +301,26 @@ app.post('/api/notify/check', authSync, async (req, res) => {
 
 // AI Composer
 app.post('/api/ai-compose', rateLimit, async (req, res) => {
-  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'Set ANTHROPIC_API_KEY on Render.' });
+  if (!GEMINI_KEY) return res.status(503).json({ error: 'Set GEMINI_API_KEY on Render.' });
   const { prompt, term, gradeContext } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: 'Prompt required' });
   const ctx = [term ? `Term: ${term}.` : '', gradeContext ? `Audience: ${gradeContext}.` : ''].filter(Boolean).join(' ');
+  const fullPrompt = `You write professional, warm school-to-parent SMS/WhatsApp messages for Tumaini Valley Springs Schools in Ruiru, Kenya. Respond ONLY with valid JSON (no markdown, no backticks): {"subject":"...","body":"...","type":"general"}. Types: fees,general,reopening,academic,transport,event. Use placeholders: {parent},{student},{grade},{term},{balance}.\n\n${ctx ? ctx + '\n\n' : ''}${prompt}`;
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6', max_tokens: 1000,
-        system: 'You write professional, warm school-to-parent SMS/WhatsApp messages for Tumaini Valley Springs in Ruiru, Kenya. Respond ONLY as JSON: {"subject":"...","body":"...","type":"general"}. Types: fees,general,reopening,academic,transport,event. Use placeholders: {parent},{student},{grade},{term},{balance}.',
-        messages: [{ role: 'user', content: ctx ? `${ctx}\n\n${prompt}` : prompt }]
-      })
-    });
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: fullPrompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
+        })
+      }
+    );
     const d = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'AI failed' });
-    const text   = d.content?.find(c => c.type === 'text')?.text || '{}';
+    if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Gemini AI failed' });
+    const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
     res.json(parsed);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -359,7 +364,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`╚══════════════════════════════════════╝`);
   console.log(`  Port:  ${PORT}`);
   console.log(`  Sync:  ${MONGO_URI     ? '✅ MongoDB'  : '⚠️  No DB'}`);
-  console.log(`  AI:    ${ANTHROPIC_KEY ? '✅ Enabled'  : '⚠️  No key'}`);
+  console.log(`  AI:    ${GEMINI_KEY ? '✅ Gemini' : '⚠️  No key (set GEMINI_API_KEY)'}`);
   console.log(`  Push:  ${VAPID_PUBLIC  ? '✅ Enabled'  : '⚠️  No VAPID'}`);
   console.log(`  SMS:   ${adminPhone    ? '✅ ' + adminPhone : '⚠️  No phone'}\n`);
 });
