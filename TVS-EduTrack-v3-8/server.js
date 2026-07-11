@@ -301,14 +301,14 @@ app.post('/api/notify/check', authSync, async (req, res) => {
 
 // AI Composer
 app.post('/api/ai-compose', rateLimit, async (req, res) => {
-  if (!GEMINI_KEY) return res.status(503).json({ error: 'Set GEMINI_API_KEY in environment variables.' });
+  if (!GEMINI_KEY) return res.status(503).json({ error: 'Set GEMINI_API_KEY on Render.' });
   const { prompt, term, gradeContext } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: 'Prompt required' });
   const ctx = [term ? `Term: ${term}.` : '', gradeContext ? `Audience: ${gradeContext}.` : ''].filter(Boolean).join(' ');
   const fullPrompt = `You write professional, warm school-to-parent SMS/WhatsApp messages for Tumaini Valley Springs Schools in Ruiru, Kenya. Respond ONLY with valid JSON (no markdown, no backticks): {"subject":"...","body":"...","type":"general"}. Types: fees,general,reopening,academic,transport,event. Use placeholders: {parent},{student},{grade},{term},{balance}.\n\n${ctx ? ctx + '\n\n' : ''}${prompt}`;
   try {
     const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
