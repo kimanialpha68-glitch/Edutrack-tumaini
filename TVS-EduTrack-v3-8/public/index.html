@@ -1666,7 +1666,13 @@ function App({
   const applyRemoteData = React.useCallback((d, savedAt) => {
     if (!d) return;
     if (savedAt && savedAt === lastSavedAtRef.current) return; // already have this version
-    if (localStorage.getItem('edutrack_dirty') === '1') return; // have unsent local edits — don't overwrite them
+    // NOTE: no "dirty" check here — this fires for BOTH the initial pull-on-load
+    // (which already guards itself, see below) AND live WebSocket broadcasts from
+    // other devices. Blocking it here used to cause a nasty bug: if Device B had
+    // any unsynced edit sitting in its own save-delay window when Device A pushed
+    // a change, B would ignore A's update, then overwrite the server with its own
+    // stale snapshot moments later — silently undoing A's delete/edit. Live
+    // updates from other devices must always be applied for real-time sync to work.
     lastSavedAtRef.current = savedAt || lastSavedAtRef.current;
     suppressNextPushRef.current = true; // avoid echoing this back to the server
     if (d.students)  setStudents(d.students);
@@ -9985,6 +9991,7 @@ function Messaging({
 }) {
   const [tab, setTab] = useState('compose');
   const [channel, setChannel] = useState('sms'); // 'sms' | 'whatsapp' | 'both'
+  const [recipientSearch, setRecipientSearch] = useState('');
   const [form, setForm] = useState({
     recipients: 'all',
     gradeFilter: '',
@@ -10013,8 +10020,15 @@ function Messaging({
     if (form.recipients === 'grade') return students.filter(s => s.grade === form.gradeFilter);
     if (form.recipients === 'transport') return students.filter(s => s.transportMode === 'One-Way' || s.transportMode === 'Two-Way');
     if (form.recipients === 'debtors') return students.filter(s => {
-      const f = fees.find(ff => ff.studentId === s.id);
-      return f && f.paid < f.amount;
+      // Match this student's fee record for the CURRENT term specifically —
+      // previously this grabbed whichever record came first regardless of
+      // term, so a student fully paid up for an old term (but owing or
+      // partially paid for the current one) could be wrongly skipped.
+      const f = fees.find(ff => ff.studentId === s.id && ff.term === CURRENT_TERM);
+      if (!f) return false; // no fee record for this term yet — not flagged as a defaulter
+      const paid = parseFloat(f.paid) || 0;
+      const amount = parseFloat(f.amount) || 0;
+      return paid < amount; // covers both partial payments and zero/pending
     });
     if (form.recipients === 'selected') return students.filter(s => form.selectedIds.includes(s.id));
     return students;
@@ -10158,7 +10172,7 @@ function Messaging({
     style: {
       marginBottom: 16
     }
-  }, "\u26A0\uFE0F Africa's Talking not configured — messages cannot be sent. Go to Settings → AT Credentials to set up. ", /*#__PURE__*/React.createElement("button", {
+  }, "\u26A0\uFE0F Africa's Talking credentials not configured. ", /*#__PURE__*/React.createElement("button", {
     className: "btn btn-rose btn-sm",
     style: {
       marginLeft: 8
@@ -10260,7 +10274,7 @@ function Messaging({
       padding: '2px 8px',
       borderRadius: 99
     }
-  }, "Powered by Gemini AI"), aiStatus === true && /*#__PURE__*/React.createElement("span", {
+  }, "Powered by Claude"), aiStatus === true && /*#__PURE__*/React.createElement("span", {
     className: "badge badge-green",
     style: {
       marginLeft: 'auto'
@@ -10284,7 +10298,7 @@ function Messaging({
       background: 'var(--navy3)',
       borderRadius: 8
     }
-  }, "\u26A0\uFE0F AI Composer is not active. Set the ", /*#__PURE__*/React.createElement("code", null, "GEMINI_API_KEY"), " environment variable on Render to enable this feature."), /*#__PURE__*/React.createElement("div", {
+  }, "\u26A0\uFE0F AI Composer is not active. Set the ", /*#__PURE__*/React.createElement("code", null, "GEMINI_API_KEY"), " environment variable on your Render service to enable this feature."), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 8
@@ -10359,7 +10373,15 @@ function Messaging({
     key: g
   }, g)))), form.recipients === 'selected' && /*#__PURE__*/React.createElement("div", {
     className: "form-group"
-  }, /*#__PURE__*/React.createElement("label", null, "Select Students"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("label", null, "Select Students"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    placeholder: "\uD83D\uDD0D Search by name, grade, or phone...",
+    value: recipientSearch,
+    onChange: e => setRecipientSearch(e.target.value),
+    style: {
+      marginBottom: 8
+    }
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       background: 'var(--navy3)',
       borderRadius: 8,
@@ -10367,7 +10389,11 @@ function Messaging({
       maxHeight: 150,
       overflowY: 'auto'
     }
-  }, students.map(s => /*#__PURE__*/React.createElement("label", {
+  }, students.filter(s => {
+    const q = recipientSearch.trim().toLowerCase();
+    if (!q) return true;
+    return s.name?.toLowerCase().includes(q) || s.grade?.toLowerCase().includes(q) || s.phone?.toLowerCase().includes(q) || s.parent?.toLowerCase().includes(q);
+  }).map(s => /*#__PURE__*/React.createElement("label", {
     key: s.id,
     style: {
       display: 'flex',
