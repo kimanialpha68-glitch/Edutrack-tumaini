@@ -2,7 +2,7 @@
  * Tumaini Valley Springs — EduTrack Server v4
  * WebSocket sync + AI Composer + SMS/WhatsApp + Push Notifications
  *
- * Required env vars (set in Bonto dashboard → Settings → Environment):
+ * Required env vars on Render:
  *   MONGODB_URI        — MongoDB Atlas connection string
  *   SYNC_SECRET        — Any password to protect sync
  *   GEMINI_API_KEY     — Google Gemini AI (for AI Message Composer)
@@ -90,13 +90,6 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.searchParams.get('secret') !== SYNC_SECRET) { ws.close(4001, 'Unauthorized'); return; }
   clients.add(ws);
-
-  // Keep-alive ping every 25 seconds to prevent Bonto sleeping during active sessions
-  const pingInterval = setInterval(() => {
-    if (ws.readyState === ws.OPEN) ws.ping();
-    else clearInterval(pingInterval);
-  }, 25000);
-  ws.on('pong', () => {}); // client responds automatically
   if (db) {
     db.collection(COLL_DATA).findOne({ _id: 'main' }).then(doc => {
       if (doc && ws.readyState === ws.OPEN) {
@@ -105,8 +98,8 @@ wss.on('connection', (ws, req) => {
       }
     }).catch(() => {});
   }
-  ws.on('close', () => { clients.delete(ws); clearInterval(pingInterval); });
-  ws.on('error', () => { clients.delete(ws); clearInterval(pingInterval); });
+  ws.on('close', () => clients.delete(ws));
+  ws.on('error', () => clients.delete(ws));
 });
 function broadcast(data, savedAt) {
   const p = JSON.stringify({ type: 'update', data, savedAt });
@@ -190,23 +183,14 @@ async function runAlertCheck(data) {
 }
 
 function startAlertScheduler() {
-  let lastAlertRun = 0;
-  const MIN_INTERVAL = 55 * 60 * 1000; // minimum 55 minutes between alert checks
-
-  async function doCheck() {
-    const now = Date.now();
-    if (now - lastAlertRun < MIN_INTERVAL) return; // skip if too soon
-    lastAlertRun = now;
-    try {
-      const doc = await db.collection(COLL_DATA).findOne({ _id: 'main' });
-      if (doc) { const { _id, savedAt, ...data } = doc; await runAlertCheck(data); }
-    } catch (e) { console.error('[Scheduler]', e.message); }
-  }
-
-  // First run 2 minutes after startup
-  setTimeout(doCheck, 2 * 60 * 1000);
-  // Then every hour
-  setInterval(doCheck, 60 * 60 * 1000);
+  setTimeout(async () => {
+    const doc = await db.collection(COLL_DATA).findOne({ _id: 'main' }).catch(() => null);
+    if (doc) { const { _id, savedAt, ...data } = doc; await runAlertCheck(data).catch(() => {}); }
+  }, 15000);
+  setInterval(async () => {
+    const doc = await db.collection(COLL_DATA).findOne({ _id: 'main' }).catch(() => null);
+    if (doc) { const { _id, savedAt, ...data } = doc; await runAlertCheck(data).catch(() => {}); }
+  }, 3600000);
 }
 
 // ════════════════════════════════════════════
@@ -248,7 +232,7 @@ app.post('/api/sync', authSync, async (req, res) => {
       adminPhone = data.adminPhone;
       db.collection(COLL_CFG).replaceOne({ _id: 'adminPhone' }, { _id: 'adminPhone', value: data.adminPhone }, { upsert: true }).catch(() => {});
     }
-    // Alert check runs hourly via scheduler only (not on every sync to prevent spam)
+    setImmediate(() => runAlertCheck(data).catch(() => {}));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -317,7 +301,7 @@ app.post('/api/notify/check', authSync, async (req, res) => {
 
 // AI Composer
 app.post('/api/ai-compose', rateLimit, async (req, res) => {
-  if (!GEMINI_KEY) return res.status(503).json({ error: 'Set GEMINI_API_KEY in your hosting platform environment variables.' });
+  if (!GEMINI_KEY) return res.status(503).json({ error: 'Set GEMINI_API_KEY in environment variables.' });
   const { prompt, term, gradeContext } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: 'Prompt required' });
   const ctx = [term ? `Term: ${term}.` : '', gradeContext ? `Audience: ${gradeContext}.` : ''].filter(Boolean).join(' ');
