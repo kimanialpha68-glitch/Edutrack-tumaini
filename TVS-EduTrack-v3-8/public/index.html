@@ -1697,7 +1697,7 @@ function App({
     if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
     localStorage.setItem('edutrack_dirty', '1'); // mark unsynced local change (survives reload)
     clearTimeout(syncTimer.current);
-    setSyncStatus('pending');
+    setSyncStatus('local'); // data saved locally, push manually
     syncTimer.current = setTimeout(async () => {
       setSyncStatus('syncing');
       const result = await cloudPush(collectData(), syncConfig);
@@ -1713,7 +1713,7 @@ function App({
         setSyncStatus('error');
         setSyncMsg(result.error || 'Sync failed');
       }
-    }, 1500);
+    }, 60000); // 60s debounce — reduces bandwidth significantly
   }, [syncConfig, collectData]);
 
   // Immediate push — used for destructive operations (delete, clear)
@@ -1737,38 +1737,29 @@ function App({
     }
   }, [syncConfig, collectData]);
 
-  // Flush pending sync before page unload
-  React.useEffect(() => {
-    const flush = () => {
-      if (syncStatus === 'pending' && syncConfig.proxyUrl && syncConfig.syncSecret) {
-        clearTimeout(syncTimer.current);
-        const data = collectData();
-        const body = JSON.stringify({ data });
-        navigator.sendBeacon
-          ? navigator.sendBeacon(
-              `${syncConfig.proxyUrl}/api/sync`,
-              new Blob([body], { type: 'application/json' })
-            )
-          : fetch(`${syncConfig.proxyUrl}/api/sync`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-sync-secret': syncConfig.syncSecret },
-              body,
-              keepalive: true
-            });
-      }
-    };
-    window.addEventListener('beforeunload', flush);
-    return () => window.removeEventListener('beforeunload', flush);
-  }, [syncStatus, syncConfig, collectData]);
+  // beforeunload flush removed — manual sync only
 
-  // Trigger push whenever any data changes
+  // Auto-sync: once daily at end of day (10:00 PM Nairobi time)
   React.useEffect(() => {
-    if (suppressNextPushRef.current) {
-      suppressNextPushRef.current = false;
-      return;
-    }
-    schedulePush();
-  }, [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
+    const scheduleEODSync = () => {
+      const now = new Date();
+      // Target 10:00 PM Nairobi time (EAT = UTC+3)
+      const nairobi = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+      const target = new Date(nairobi);
+      target.setHours(22, 0, 0, 0); // 10:00 PM
+      if (nairobi >= target) target.setDate(target.getDate() + 1); // next day if already past
+      const msUntil = target - nairobi;
+      return setTimeout(() => {
+        if (syncConfig.proxyUrl && syncConfig.syncSecret) {
+          manualPush();
+          console.log('[Auto-sync] End-of-day push completed at', new Date().toLocaleString());
+        }
+        scheduleEODSync(); // reschedule for next day
+      }, msUntil);
+    };
+    const timer = scheduleEODSync();
+    return () => clearTimeout(timer);
+  }, [syncConfig.proxyUrl, syncConfig.syncSecret]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Real-time WebSocket sync — connection ─────────────────────────────────
 
