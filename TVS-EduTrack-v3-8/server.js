@@ -57,7 +57,8 @@ async function connectMongo() {
       const cfg = await db.collection(COLL_CFG).findOne({ _id: 'adminPhone' }).catch(() => null);
       if (cfg) adminPhone = cfg.value;
     }
-    startAlertScheduler();
+    // Alerts/SMS scheduler disabled per admin request (was sending recurring push/SMS notifications)
+    // startAlertScheduler();
   } catch (e) { console.error('❌ MongoDB failed:', e.message); }
 }
 connectMongo();
@@ -314,25 +315,15 @@ app.post('/api/ai-compose', rateLimit, async (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: fullPrompt }] }],
-          // Gemini 2.5/3.x "thinking" models spend part of maxOutputTokens on
-          // invisible internal reasoning before writing the actual answer —
-          // thinkingBudget: 0 turns that off so the full token budget goes to
-          // the visible JSON response (avoids responses getting cut off mid-string).
-          generationConfig: { temperature: 0.7, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } }
+          generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
         })
       }
     );
     const d = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Gemini AI failed' });
     const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-    try {
-      const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
-      res.json(parsed);
-    } catch {
-      // Model didn't return clean JSON (rare, but happens) — fall back to using
-      // the raw text as the message body instead of failing the whole request.
-      res.json({ subject: '', body: text.replace(/```json|```/g, '').trim(), type: 'general' });
-    }
+    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    res.json(parsed);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
