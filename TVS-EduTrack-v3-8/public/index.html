@@ -1530,12 +1530,7 @@ function App({
   const [fees, setFees] = usePersist('fees', initFees);
 
   // ── Migration: fix term + merge duplicate records + add paymentHistory ──
-  // Guarded to run ONCE ever (not on every app load) — it used to force-rewrite
-  // every fee record's term to match a hardcoded CURRENT_TERM and merge by
-  // studentId+term on every single reload, which could silently collapse or
-  // relabel genuine fee records for terms other than the current one.
   React.useEffect(() => {
-    if (localStorage.getItem('edutrack_fees_migration_v1_done') === '1') return;
     setFees(prev => {
       // Step 1: update all terms to current
       let updated = prev.map(f => f.term !== CURRENT_TERM ? { ...f, term: CURRENT_TERM } : f);
@@ -1568,7 +1563,6 @@ function App({
       const changed = merged.length !== prev.length || merged.some((f, i) => f.paid !== prev[i]?.paid || !f.paymentHistory);
       return changed ? merged : prev;
     });
-    localStorage.setItem('edutrack_fees_migration_v1_done', '1');
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [inventory, setInventory] = usePersist('inventory', initInventory);
   const [vehicles, setVehicles] = usePersist('vehicles', initVehicles);
@@ -1629,6 +1623,7 @@ function App({
     proxyUrl: TVSA_SERVER
   });
   const [adminPhone, setAdminPhone] = usePersist('adminPhone', '');
+  const [feeDueDate, setFeeDueDate] = usePersist('feeDueDate', '');
   const [modal, setModal] = useState(null);
   const [receipt, setReceipt] = useState(null);
   const [toast, setToast] = useState(null);
@@ -1666,13 +1661,6 @@ function App({
   const applyRemoteData = React.useCallback((d, savedAt) => {
     if (!d) return;
     if (savedAt && savedAt === lastSavedAtRef.current) return; // already have this version
-    // NOTE: no "dirty" check here — this fires for BOTH the initial pull-on-load
-    // (which already guards itself, see below) AND live WebSocket broadcasts from
-    // other devices. Blocking it here used to cause a nasty bug: if Device B had
-    // any unsynced edit sitting in its own save-delay window when Device A pushed
-    // a change, B would ignore A's update, then overwrite the server with its own
-    // stale snapshot moments later — silently undoing A's delete/edit. Live
-    // updates from other devices must always be applied for real-time sync to work.
     lastSavedAtRef.current = savedAt || lastSavedAtRef.current;
     suppressNextPushRef.current = true; // avoid echoing this back to the server
     if (d.students)  setStudents(d.students);
@@ -1695,9 +1683,8 @@ function App({
   // Debounced auto-push — fires 3s after last change
   const schedulePush = React.useCallback(() => {
     if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
-    localStorage.setItem('edutrack_dirty', '1'); // mark unsynced local change (survives reload)
     clearTimeout(syncTimer.current);
-    setSyncStatus('local'); // data saved locally, push manually
+    setSyncStatus('pending');
     syncTimer.current = setTimeout(async () => {
       setSyncStatus('syncing');
       const result = await cloudPush(collectData(), syncConfig);
@@ -1707,19 +1694,17 @@ function App({
         const ts = new Date().toLocaleString();
         setLastSync(ts);
         localStorage.setItem('edutrack_last_sync', ts);
-        localStorage.removeItem('edutrack_dirty'); // confirmed on server, safe to pull now
         if (result.savedAt) lastSavedAtRef.current = result.savedAt;
       } else {
         setSyncStatus('error');
         setSyncMsg(result.error || 'Sync failed');
       }
-    }, 60000); // 60s debounce — reduces bandwidth significantly
+    }, 1500);
   }, [syncConfig, collectData]);
 
   // Immediate push — used for destructive operations (delete, clear)
   const immediatePush = React.useCallback(async (overrideData) => {
     if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
-    localStorage.setItem('edutrack_dirty', '1');
     clearTimeout(syncTimer.current); // cancel any pending debounce
     setSyncStatus('syncing');
     const result = await cloudPush(overrideData || collectData(), syncConfig);
@@ -1729,7 +1714,6 @@ function App({
       const ts = new Date().toLocaleString();
       setLastSync(ts);
       localStorage.setItem('edutrack_last_sync', ts);
-      localStorage.removeItem('edutrack_dirty');
       if (result.savedAt) lastSavedAtRef.current = result.savedAt;
     } else {
       setSyncStatus('error');
@@ -1737,29 +1721,38 @@ function App({
     }
   }, [syncConfig, collectData]);
 
-  // beforeunload flush removed — manual sync only
-
-  // Auto-sync: once daily at end of day (10:00 PM Nairobi time)
+  // Flush pending sync before page unload
   React.useEffect(() => {
-    const scheduleEODSync = () => {
-      const now = new Date();
-      // Target 10:00 PM Nairobi time (EAT = UTC+3)
-      const nairobi = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-      const target = new Date(nairobi);
-      target.setHours(22, 0, 0, 0); // 10:00 PM
-      if (nairobi >= target) target.setDate(target.getDate() + 1); // next day if already past
-      const msUntil = target - nairobi;
-      return setTimeout(() => {
-        if (syncConfig.proxyUrl && syncConfig.syncSecret) {
-          manualPush();
-          console.log('[Auto-sync] End-of-day push completed at', new Date().toLocaleString());
-        }
-        scheduleEODSync(); // reschedule for next day
-      }, msUntil);
+    const flush = () => {
+      if (syncStatus === 'pending' && syncConfig.proxyUrl && syncConfig.syncSecret) {
+        clearTimeout(syncTimer.current);
+        const data = collectData();
+        const body = JSON.stringify({ data });
+        navigator.sendBeacon
+          ? navigator.sendBeacon(
+              `${syncConfig.proxyUrl}/api/sync`,
+              new Blob([body], { type: 'application/json' })
+            )
+          : fetch(`${syncConfig.proxyUrl}/api/sync`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-sync-secret': syncConfig.syncSecret },
+              body,
+              keepalive: true
+            });
+      }
     };
-    const timer = scheduleEODSync();
-    return () => clearTimeout(timer);
-  }, [syncConfig.proxyUrl, syncConfig.syncSecret]); // eslint-disable-line react-hooks/exhaustive-deps
+    window.addEventListener('beforeunload', flush);
+    return () => window.removeEventListener('beforeunload', flush);
+  }, [syncStatus, syncConfig, collectData]);
+
+  // Trigger push whenever any data changes
+  React.useEffect(() => {
+    if (suppressNextPushRef.current) {
+      suppressNextPushRef.current = false;
+      return;
+    }
+    schedulePush();
+  }, [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
 
   // ── Real-time WebSocket sync — connection ─────────────────────────────────
 
@@ -1823,25 +1816,6 @@ function App({
     if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
     (async () => {
       setSyncStatus('syncing');
-      // If a previous session left local changes unsent (e.g. page reloaded
-      // right after a save, before the debounced push fired), push them to
-      // the cloud FIRST — otherwise this pull would overwrite them with the
-      // older server copy and silently "delete" whatever wasn't synced yet.
-      if (localStorage.getItem('edutrack_dirty') === '1') {
-        const pushResult = await cloudPush(collectData(), syncConfig);
-        if (pushResult.ok) {
-          localStorage.removeItem('edutrack_dirty');
-          if (pushResult.savedAt) lastSavedAtRef.current = pushResult.savedAt;
-          setSyncStatus('ok');
-          setSyncMsg(`Synced ${new Date().toLocaleTimeString()}`);
-          return; // server now matches local — no need to pull
-        }
-        // Couldn't reach the server — skip the pull so we don't clobber
-        // unsent local data. It'll retry next time data changes or on reload.
-        setSyncStatus('error');
-        setSyncMsg('Unsynced changes pending — will retry');
-        return;
-      }
       const result = await cloudPull(syncConfig);
       if (result.ok && result.data) {
         applyRemoteData(result.data, result.savedAt);
@@ -2205,7 +2179,7 @@ function App({
     onClick: () => setSidebarOpen(o => !o)
   }, "\u2630"), /*#__PURE__*/React.createElement("span", {
     className: "topbar-title"
-  }, page === 'dashboard' && 'Dashboard', page === 'students' && 'Students', page === 'exams' && 'Exam Records', page === 'alumni' && 'Alumni', page === 'promote' && 'Promote Grade', page === 'fees' && 'Fees', page === 'receipts' && 'Receipts', page === 'inventory' && 'Inventory', page === 'vehicles' && 'Fleet', page === 'fueling' && 'Fueling', page === 'repairs' && 'Repairs', page === 'messaging' && 'Messaging', page === 'msglog' && 'Message Log', page === 'settings' && 'AT Settings', page === 'diagnostics' && '🩺 System Diagnostics')), /*#__PURE__*/React.createElement("span", {
+  }, page === 'dashboard' && 'Dashboard', page === 'students' && 'Students', page === 'exams' && 'Exam Records', page === 'alumni' && 'Alumni', page === 'promote' && 'Promote Grade', page === 'fees' && 'Fees', page === 'receipts' && 'Receipts', page === 'inventory' && 'Inventory', page === 'vehicles' && 'Fleet', page === 'fueling' && 'Fueling', page === 'repairs' && 'Repairs', page === 'messaging' && 'Messaging', page === 'msglog' && 'Message Log', page === 'settings' && 'AT Settings', page === 'diagnostics' && '🩺 System Health', page === 'diagnostics' && '🩺 System Diagnostics')), /*#__PURE__*/React.createElement("span", {
     className: "topbar-date"
   }, new Date().toLocaleDateString('en-KE', {
     day: '2-digit',
@@ -2378,7 +2352,9 @@ function App({
     showToast: showToast,
     fees: fees,
     atConfig: atConfig,
-    setPage: setPage
+    setPage: setPage,
+    feeDueDate: feeDueDate,
+    setFeeDueDate: setFeeDueDate
   })), page === 'msglog' && (isTeacher ? /*#__PURE__*/React.createElement(AccessDenied, null) : /*#__PURE__*/React.createElement(MessageLog, {
     messages: messages,
     students: activeStudents
@@ -2399,6 +2375,20 @@ function App({
     session: session,
     adminPhone: adminPhone,
     setAdminPhone: setAdminPhone
+  })), page === 'diagnostics' && (isTeacher ? /*#__PURE__*/React.createElement(AccessDenied, null) : /*#__PURE__*/React.createElement(Diagnostics, {
+    students: students,
+    fees: fees,
+    exams: exams,
+    inventory: inventory,
+    vehicles: vehicles,
+    routes: routes,
+    messages: messages,
+    atConfig: atConfig,
+    syncConfig: syncConfig,
+    syncStatus: syncStatus,
+    lastSync: lastSync,
+    session: session,
+    showToast: showToast
   })), page === 'diagnostics' && (isTeacher ? /*#__PURE__*/React.createElement(AccessDenied, null) : /*#__PURE__*/React.createElement(Diagnostics, {
     students: activeStudents,
     fees: fees,
@@ -4607,8 +4597,7 @@ function Students({
   fees = [],
   setFees,
   setReceipt,
-  session,
-  immediatePush
+  session
 }) {
   const [search, setSearch] = useState('');
   const [levelFilter, setLevelFilter] = useState('');
@@ -4976,7 +4965,7 @@ function Students({
     if (!confirm('Permanently remove this student?')) return;
     const ns = students.filter(s => s.id !== id);
     setStudents(() => ns);
-    immediatePush && immediatePush();
+    schedulePush();
     setViewId(null);
     showToast('Student removed', 'rose');
   };
@@ -6817,7 +6806,7 @@ function Students({
           if (confirm('Delete this payment record?')) {
             const newFees = fees.filter(x => x.id !== f.id);
             setFees(() => newFees);
-            immediatePush && immediatePush();
+            schedulePush();
             showToast('Payment deleted', 'rose');
           }
         }
@@ -7138,8 +7127,7 @@ function Fees({
   fees,
   setFees,
   showToast,
-  setReceipt,
-  immediatePush
+  setReceipt
 }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({
@@ -7156,11 +7144,13 @@ function Fees({
   const [studentSearch, setStudentSearch] = useState('');
   const [studentDropOpen, setStudentDropOpen] = useState(false);
 
-  // NOTE: a previous "auto-cleanup" here silently deleted any fully-paid fee
-  // record whose term didn't exactly match a hardcoded CURRENT_TERM, every
-  // single time this page was opened. That destroyed real payment records
-  // (e.g. arrears cleared for a past term, or fees paid in advance). Removed —
-  // fee records are never auto-deleted. Use the manual delete button instead.
+  // ── Auto-cleanup: remove fully-paid records & receipts from PAST terms ──
+  useEffect(() => {
+    const hasOldPaid = fees.some(f => f.status === 'paid' && f.term !== CURRENT_TERM);
+    if (hasOldPaid) {
+      setFees(p => p.filter(f => !(f.status === 'paid' && f.term !== CURRENT_TERM)));
+    }
+  }, []); // run once on mount
 
   const bySearch = search.trim() ? fees.filter(f => {
     const s = students.find(st => st.id === f.studentId);
@@ -7470,7 +7460,7 @@ function Fees({
         if (confirm('Delete this payment record?')) {
           const newFees = fees.filter(x => x.id !== f.id);
           setFees(() => newFees);
-          immediatePush && immediatePush();
+          schedulePush();
           showToast('Payment deleted', 'rose');
         }
       }
@@ -7535,7 +7525,7 @@ function Fees({
         if (confirm('Delete this payment record?')) {
           const nf = fees.filter(x => x.id !== f.id);
           setFees(() => nf);
-          immediatePush && immediatePush();
+          schedulePush();
           showToast('Payment deleted', 'rose');
         }
       }
@@ -8313,8 +8303,7 @@ function Vehicles({
   setStudents,
   showToast,
   routes,
-  setRoutes,
-  immediatePush
+  setRoutes
 }) {
   const [tab, setTab] = useState('fleet');
   const [showForm, setShowForm] = useState(false);
@@ -8382,7 +8371,7 @@ function Vehicles({
     if (!confirm('Remove this vehicle?')) return;
     const nv = vehicles.filter(v => v.id !== id);
     setVehicles(() => nv);
-    immediatePush && immediatePush();
+    schedulePush();
     setViewId(null);
     showToast('Vehicle removed', 'rose');
   };
@@ -9816,7 +9805,7 @@ const MSG_TEMPLATES = [{
   label: 'Fees Reminder',
   type: 'fees',
   subject: 'School Fees Payment Reminder – {term}',
-  body: 'Dear {parent},\n\nThis is a friendly reminder that school fees for {term} are due. Your child {student} ({grade}) has an outstanding balance of {balance}.\n\nPlease make payment at your earliest convenience. You may pay via M-Pesa, Bank Transfer, or Cash at the school office.\n\nThank you.\n\nTumaini Valley Springs'
+  body: 'Dear {parent},\n\nThis is a friendly reminder that school fees for {term} are due. Your child {student} ({grade}) has an outstanding balance of {balance}, expected to be cleared by {due_date}.\n\nPlease make payment at your earliest convenience. You may pay via M-Pesa, Bank Transfer, or Cash at the school office.\n\nThank you.\n\nTumaini Valley Springs'
 }, {
   label: 'General Announcement',
   type: 'general',
@@ -9978,11 +9967,12 @@ function Messaging({
   showToast,
   fees,
   atConfig,
-  setPage
+  setPage,
+  feeDueDate,
+  setFeeDueDate
 }) {
   const [tab, setTab] = useState('compose');
   const [channel, setChannel] = useState('sms'); // 'sms' | 'whatsapp' | 'both'
-  const [recipientSearch, setRecipientSearch] = useState('');
   const [form, setForm] = useState({
     recipients: 'all',
     gradeFilter: '',
@@ -10011,24 +10001,30 @@ function Messaging({
     if (form.recipients === 'grade') return students.filter(s => s.grade === form.gradeFilter);
     if (form.recipients === 'transport') return students.filter(s => s.transportMode === 'One-Way' || s.transportMode === 'Two-Way');
     if (form.recipients === 'debtors') return students.filter(s => {
-      // Match this student's fee record for the CURRENT term specifically —
-      // previously this grabbed whichever record came first regardless of
-      // term, so a student fully paid up for an old term (but owing or
-      // partially paid for the current one) could be wrongly skipped.
-      const f = fees.find(ff => ff.studentId === s.id && ff.term === CURRENT_TERM);
-      if (!f) return false; // no fee record for this term yet — not flagged as a defaulter
-      const paid = parseFloat(f.paid) || 0;
-      const amount = parseFloat(f.amount) || 0;
-      return paid < amount; // covers both partial payments and zero/pending
+      const f = fees.find(ff => ff.studentId === s.id);
+      return f && f.paid < f.amount;
     });
     if (form.recipients === 'selected') return students.filter(s => form.selectedIds.includes(s.id));
     return students;
   };
   const recipients = getRecipients();
+  const sendIssues = React.useMemo(() => {
+    const noPhone = recipients.filter(s => !normalizePhone(s.phone));
+    const noFeeRecord = recipients.filter(s => !fees.find(f => f.studentId === s.id));
+    const usesBalance = /{balance}/.test(form.body);
+    const usesDueDate = /{due_date}/.test(form.body);
+    return {
+      noPhone,
+      noFeeRecord: usesBalance ? noFeeRecord : [],
+      missingDueDate: usesDueDate && !feeDueDate,
+      sendable: recipients.length - noPhone.length
+    };
+  }, [recipients, fees, form.body, feeDueDate]);
   const personalise = (text, student) => {
     const feeRec = fees.find(f => f.studentId === student.id);
     const balance = feeRec ? feeRec.amount - feeRec.paid : 0;
-    return text.replace(/{parent}/g, student.parent).replace(/{student}/g, student.name).replace(/{grade}/g, student.grade).replace(/{term}/g, CURRENT_TERM).replace(/{balance}/g, 'KES ' + balance.toLocaleString());
+    const dueText = feeDueDate ? fmtDate(feeDueDate) : '[due date not set — check Messaging settings]';
+    return text.replace(/{parent}/g, student.parent).replace(/{student}/g, student.name).replace(/{grade}/g, student.grade).replace(/{term}/g, CURRENT_TERM).replace(/{balance}/g, 'KES ' + balance.toLocaleString()).replace(/{due_date}/g, dueText);
   };
   const applyTemplate = tpl => {
     setForm(p => ({
@@ -10083,6 +10079,10 @@ function Messaging({
       showToast('Configure Africa\'s Talking credentials first', 'rose');
       setPage('settings');
       return;
+    }
+    if (sendIssues.noPhone.length > 0) {
+      const proceed = window.confirm(`${sendIssues.noPhone.length} of ${recipients.length} recipient(s) have no valid phone number and will be skipped. Send to the remaining ${sendIssues.sendable}?`);
+      if (!proceed) return;
     }
     setSending(true);
     setSendLog([]);
@@ -10333,6 +10333,18 @@ function Messaging({
     }
   }, /*#__PURE__*/React.createElement("div", {
     className: "form-group"
+  }, /*#__PURE__*/React.createElement("label", null, "Fee Due Date (fills {due_date})"), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: feeDueDate || '',
+    onChange: e => setFeeDueDate(e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '0.7rem',
+      color: 'var(--text2)',
+      marginTop: 4
+    }
+  }, "Set once per term — used whenever a message includes {due_date}, e.g. fee reminders.")), /*#__PURE__*/React.createElement("div", {
+    className: "form-group"
   }, /*#__PURE__*/React.createElement("label", null, "Send To"), /*#__PURE__*/React.createElement("select", {
     value: form.recipients,
     onChange: e => setForm(p => ({
@@ -10364,15 +10376,7 @@ function Messaging({
     key: g
   }, g)))), form.recipients === 'selected' && /*#__PURE__*/React.createElement("div", {
     className: "form-group"
-  }, /*#__PURE__*/React.createElement("label", null, "Select Students"), /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    placeholder: "\uD83D\uDD0D Search by name, grade, or phone...",
-    value: recipientSearch,
-    onChange: e => setRecipientSearch(e.target.value),
-    style: {
-      marginBottom: 8
-    }
-  }), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("label", null, "Select Students"), /*#__PURE__*/React.createElement("div", {
     style: {
       background: 'var(--navy3)',
       borderRadius: 8,
@@ -10380,11 +10384,7 @@ function Messaging({
       maxHeight: 150,
       overflowY: 'auto'
     }
-  }, students.filter(s => {
-    const q = recipientSearch.trim().toLowerCase();
-    if (!q) return true;
-    return s.name?.toLowerCase().includes(q) || s.grade?.toLowerCase().includes(q) || s.phone?.toLowerCase().includes(q) || s.parent?.toLowerCase().includes(q);
-  }).map(s => /*#__PURE__*/React.createElement("label", {
+  }, students.map(s => /*#__PURE__*/React.createElement("label", {
     key: s.id,
     style: {
       display: 'flex',
@@ -10467,7 +10467,7 @@ function Messaging({
       fontFamily: 'monospace',
       color: 'var(--gold)'
     }
-  }, '{parent} {student} {grade} {term} {balance}')), /*#__PURE__*/React.createElement("span", {
+  }, '{parent} {student} {grade} {term} {balance} {due_date}')), /*#__PURE__*/React.createElement("span", {
     style: {
       color: form.body.length > 160 ? 'var(--rose)' : 'var(--text2)'
     }
@@ -10642,7 +10642,16 @@ function Messaging({
       fontSize: '0.75rem',
       color: 'var(--text2)'
     }
-  }, "\u2705 ", sendLog.filter(l => l.smsStatus === 'Success' || l.waStatus === 'Success').length, " delivered \xB7 \u2717 ", sendLog.filter(l => l.smsStatus !== 'Success' && l.waStatus !== 'Success' && l.smsStatus !== '—').length, " failed")), /*#__PURE__*/React.createElement("button", {
+  }, "\u2705 ", sendLog.filter(l => l.smsStatus === 'Success' || l.waStatus === 'Success').length, " delivered \xB7 \u2717 ", sendLog.filter(l => l.smsStatus !== 'Success' && l.waStatus !== 'Success' && l.smsStatus !== '—').length, " failed")), !sendDone && (sendIssues.noPhone.length > 0 || sendIssues.noFeeRecord.length > 0 || sendIssues.missingDueDate) && /*#__PURE__*/React.createElement("div", {
+    className: "alert alert-gold",
+    style: {
+      marginBottom: 10,
+      fontSize: '0.78rem',
+      lineHeight: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 600, marginBottom: 4 }
+  }, "\u26A0\uFE0F Before you send:"), sendIssues.noPhone.length > 0 && /*#__PURE__*/React.createElement("div", null, "\u2022 ", sendIssues.noPhone.length, " of ", recipients.length, " recipient(s) have no valid phone number and will be skipped: ", sendIssues.noPhone.slice(0, 5).map(s => s.name).join(', '), sendIssues.noPhone.length > 5 ? ` +${sendIssues.noPhone.length - 5} more` : ''), sendIssues.noFeeRecord.length > 0 && /*#__PURE__*/React.createElement("div", null, "\u2022 ", sendIssues.noFeeRecord.length, " recipient(s) have no fee record on file \u2014 their {balance} will show as KES 0: ", sendIssues.noFeeRecord.slice(0, 5).map(s => s.name).join(', '), sendIssues.noFeeRecord.length > 5 ? ` +${sendIssues.noFeeRecord.length - 5} more` : ''), sendIssues.missingDueDate && /*#__PURE__*/React.createElement("div", null, "\u2022 Message uses {due_date} but no Fee Due Date is set above \u2014 parents will see a placeholder warning instead of a date.")), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
     style: {
       width: '100%',
@@ -10835,8 +10844,6 @@ function Diagnostics({
   const [results, setResults] = useState(null);
   const [proxyRes, setProxyRes] = useState(null);
   const [mongoRes, setMongoRes] = useState(null);
-  const isMountedRef = React.useRef(true);
-  React.useEffect(() => () => { isMountedRef.current = false; }, []);
   const runDiagnostics = async () => {
     setRunning(true);
     setResults(null);
@@ -11007,7 +11014,6 @@ function Diagnostics({
       });
       const d = await r.json();
       const ms = Date.now() - t0;
-      if (!isMountedRef.current) return; // navigated away mid-request
       setProxyRes({
         status: d.ok ? 'pass' : 'fail',
         msg: d.ok ? `Online · ${ms}ms response · Sync: ${d.sync}` : 'Ping returned unexpected response',
@@ -11022,7 +11028,6 @@ function Diagnostics({
         msg: 'Server online but MongoDB not connected. Check MONGODB_URI on Render.'
       });
     } catch (e) {
-      if (!isMountedRef.current) return; // navigated away mid-request
       setProxyRes({
         status: 'fail',
         msg: `Unreachable — ${e.message.slice(0, 60)}`,
@@ -11033,7 +11038,7 @@ function Diagnostics({
         msg: 'Cannot verify — server is offline'
       });
     }
-    if (isMountedRef.current) setRunning(false);
+    setRunning(false);
   };
   React.useEffect(() => {
     runDiagnostics();
@@ -12248,23 +12253,19 @@ function ATSettings({
       marginBottom: 12
     }
   }, "\uD83D\uDCCB Setup Checklist"), [{
-    id: 'username',
     done: !!form.username,
     label: 'Africa\'s Talking username set'
   }, {
-    id: 'apiKey',
     done: form.sandbox || !!form.apiKey,
     label: 'API key configured (or sandbox mode)'
   }, {
-    id: 'shortCode',
     done: !!form.shortCode,
     label: 'SMS sender ID set'
   }, {
-    id: 'whatsapp',
     done: !form.whatsappEnabled || form.whatsappEnabled && !!form.whatsappFrom,
     label: 'WhatsApp sender configured (if enabled)'
-  }].map(c => /*#__PURE__*/React.createElement("div", {
-    key: c.id,
+  }].map((c, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
     style: {
       display: 'flex',
       alignItems: 'center',
