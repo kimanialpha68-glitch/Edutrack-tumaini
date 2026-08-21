@@ -306,7 +306,7 @@ app.post('/api/ai-compose', rateLimit, async (req, res) => {
   const fullPrompt = `You write professional, warm school-to-parent SMS/WhatsApp messages for Tumaini Valley Springs Schools in Ruiru, Kenya. Respond ONLY with valid JSON (no markdown, no backticks): {"subject":"...","body":"...","type":"general"}. Types: fees,general,reopening,academic,transport,event. Use placeholders: {parent},{student},{grade},{term},{balance},{due_date} — {balance} is the individual outstanding amount and {due_date} is when it is expected to be cleared, both filled in per-parent when the message is sent. For fee-related messages, include both {balance} and {due_date} naturally in the body.\n\n${ctx ? ctx + '\n\n' : ''}${prompt}`;
   try {
     const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
