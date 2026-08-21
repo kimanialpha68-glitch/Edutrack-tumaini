@@ -13,7 +13,6 @@
 
 const express  = require('express');
 const cors     = require('cors');
-const compression = require('compression');
 const fetch    = require('node-fetch');
 const path     = require('path');
 const http     = require('http');
@@ -23,7 +22,7 @@ const { MongoClient }     = require('mongodb');
 
 const app    = express();
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server, perMessageDeflate: true });
+const wss    = new WebSocketServer({ server });
 
 const PORT          = process.env.PORT              || 3000;
 const MONGO_URI     = process.env.MONGODB_URI       || null;
@@ -57,14 +56,12 @@ async function connectMongo() {
       const cfg = await db.collection(COLL_CFG).findOne({ _id: 'adminPhone' }).catch(() => null);
       if (cfg) adminPhone = cfg.value;
     }
-    // Alerts/SMS scheduler disabled per admin request (was sending recurring push/SMS notifications)
-    // startAlertScheduler();
+    startAlertScheduler();
   } catch (e) { console.error('❌ MongoDB failed:', e.message); }
 }
 connectMongo();
 
 app.use(cors({ origin: '*' }));
-app.use(compression()); // gzip all JSON/static responses — biggest single lever on bandwidth
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -306,23 +303,38 @@ app.post('/api/ai-compose', rateLimit, async (req, res) => {
   const { prompt, term, gradeContext } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: 'Prompt required' });
   const ctx = [term ? `Term: ${term}.` : '', gradeContext ? `Audience: ${gradeContext}.` : ''].filter(Boolean).join(' ');
-  const fullPrompt = `You write professional, warm school-to-parent SMS/WhatsApp messages for Tumaini Valley Springs Schools in Ruiru, Kenya. Respond ONLY with valid JSON (no markdown, no backticks): {"subject":"...","body":"...","type":"general"}. Types: fees,general,reopening,academic,transport,event. Use placeholders: {parent},{student},{grade},{term},{balance}.\n\n${ctx ? ctx + '\n\n' : ''}${prompt}`;
+  const fullPrompt = `You write professional, warm school-to-parent SMS/WhatsApp messages for Tumaini Valley Springs Schools in Ruiru, Kenya. Respond ONLY with valid JSON (no markdown, no backticks): {"subject":"...","body":"...","type":"general"}. Types: fees,general,reopening,academic,transport,event. Use placeholders: {parent},{student},{grade},{term},{balance},{due_date} — {balance} is the individual outstanding amount and {due_date} is when it is expected to be cleared, both filled in per-parent when the message is sent. For fee-related messages, include both {balance} and {due_date} naturally in the body.\n\n${ctx ? ctx + '\n\n' : ''}${prompt}`;
   try {
     const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: fullPrompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
+          generationConfig: { temperature: 0.7, maxOutputTokens: 800 }
         })
       }
     );
     const d = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: d.error?.message || 'Gemini AI failed' });
     const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    const cleaned = text.replace(/```json|```/g, '').trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (jsonErr) {
+      // Fallback: Gemini occasionally leaves an unescaped quote or line break inside
+      // a field, which breaks strict JSON.parse. Pull subject/body/type out directly
+      // instead of failing the whole request.
+      const extract = key => {
+        const m = cleaned.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+        return m ? m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"') : null;
+      };
+      const body = extract('body');
+      if (!body) return res.status(500).json({ error: 'AI returned malformed output — try rephrasing your prompt.' });
+      parsed = { subject: extract('subject'), body, type: extract('type') || 'general' };
+    }
     res.json(parsed);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
