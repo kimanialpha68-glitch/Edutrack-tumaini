@@ -1311,6 +1311,20 @@ function LoginPage({
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPin, setShowPin] = useState(false);
+  const [checkingAccounts, setCheckingAccounts] = useState(true);
+  React.useEffect(() => {
+    // Pull the latest accounts from the cloud before allowing login, so a staff
+    // member whose account was created on a different device can log in here too.
+    // Capped at 4s so a slow/offline connection never blocks login for long —
+    // falls back to whatever accounts are already cached on this device.
+    const cfg = getSyncConfig();
+    const timeout = new Promise(resolve => setTimeout(() => resolve({ ok: false }), 4000));
+    Promise.race([cloudPull(cfg), timeout]).then(result => {
+      if (result.ok && result.data && result.data.accounts) {
+        saveAccounts(result.data.accounts);
+      }
+    }).catch(() => {}).finally(() => setCheckingAccounts(false));
+  }, []);
   const submit = () => {
     setError('');
     if (!username.trim()) {
@@ -1415,8 +1429,8 @@ function LoginPage({
   }, showPin ? '🙈' : '👁'))), /*#__PURE__*/React.createElement("button", {
     className: "login-btn",
     onClick: submit,
-    disabled: loading
-  }, loading ? '⏳ Signing in…' : '🔐 Sign In'))));
+    disabled: loading || checkingAccounts
+  }, loading ? '⏳ Signing in…' : checkingAccounts ? '🔄 Checking for account updates…' : '🔐 Sign In'))));
 }
 
 // ──────────── ROOT (auth guard) ────────────
@@ -1624,6 +1638,16 @@ function App({
   });
   const [adminPhone, setAdminPhone] = usePersist('adminPhone', '');
   const [feeDueDate, setFeeDueDate] = usePersist('feeDueDate', '');
+  // Accounts share AUTH_KEY storage (same key LoginPage reads) so both stay in sync —
+  // included in collectData() below so account changes propagate to other devices.
+  const [accounts, setAccountsState] = useState(() => loadAccounts() || getDefaultAccounts());
+  const setAccounts = React.useCallback(updater => {
+    setAccountsState(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      saveAccounts(next);
+      return next;
+    });
+  }, []);
   const [modal, setModal] = useState(null);
   const [receipt, setReceipt] = useState(null);
   const [toast, setToast] = useState(null);
@@ -1650,8 +1674,9 @@ function App({
     repairs,
     alumni,
     exams,
-    messages
-  }), [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
+    messages,
+    accounts
+  }), [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages, accounts]);
 
   // ── Real-time WebSocket sync — refs & helpers ─────────────────────────────
   const suppressNextPushRef = React.useRef(false);
@@ -1673,12 +1698,13 @@ function App({
     if (d.alumni)    setAlumni(d.alumni);
     if (d.exams)     setExams(d.exams);
     if (d.messages)  setMessages(d.messages);
+    if (d.accounts)  setAccounts(d.accounts);
     const ts = new Date().toLocaleString();
     setLastSync(ts);
     localStorage.setItem('edutrack_last_sync', ts);
     setSyncStatus('ok');
     setSyncMsg(`Live update received ${new Date().toLocaleTimeString()}`);
-  }, [setStudents, setFees, setInventory, setVehicles, setRoutes, setFueling, setRepairs, setAlumni, setExams, setMessages]);
+  }, [setStudents, setFees, setInventory, setVehicles, setRoutes, setFueling, setRepairs, setAlumni, setExams, setMessages, setAccounts]);
 
   // Debounced auto-push — fires 3s after last change
   const schedulePush = React.useCallback(() => {
@@ -1752,7 +1778,7 @@ function App({
       return;
     }
     schedulePush();
-  }, [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
+  }, [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages, accounts]);
 
   // ── Real-time WebSocket sync — connection ─────────────────────────────────
 
@@ -7143,6 +7169,9 @@ function Fees({
   const [search, setSearch] = useState('');
   const [studentSearch, setStudentSearch] = useState('');
   const [studentDropOpen, setStudentDropOpen] = useState(false);
+  const [showBulk, setShowBulk] = useState(false);
+  const [bulkGrade, setBulkGrade] = useState('all');
+  const [bulkAmount, setBulkAmount] = useState('8500');
 
   // ── Auto-cleanup: remove fully-paid records & receipts from PAST terms ──
   useEffect(() => {
@@ -7208,6 +7237,28 @@ function Fees({
     setStudentDropOpen(false);
     showToast('Payment recorded!');
   };
+  const bulkSetFees = () => {
+    const amtNum = parseFloat(bulkAmount);
+    if (isNaN(amtNum) || amtNum <= 0) { showToast('Enter a valid amount', 'rose'); return; }
+    const target = bulkGrade === 'all' ? students : students.filter(s => s.grade === bulkGrade);
+    const alreadyHas = new Set(fees.filter(f => f.term === CURRENT_TERM).map(f => f.studentId));
+    const toCreate = target.filter(s => !alreadyHas.has(s.id));
+    if (toCreate.length === 0) { showToast('Every student in that selection already has a fee record for this term', 'gold'); return; }
+    setFees(prev => [...prev, ...toCreate.map(s => ({
+      id: 'F' + uid(),
+      studentId: s.id,
+      term: CURRENT_TERM,
+      amount: amtNum,
+      paid: 0,
+      status: 'pending',
+      method: '',
+      ref: '',
+      date: today(),
+      paymentHistory: []
+    }))]);
+    showToast(`✅ Fee of KES ${amtNum.toLocaleString()} set for ${toCreate.length} student(s). ${target.length - toCreate.length} already had a record.`);
+    setShowBulk(false);
+  };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "section-header"
   }, /*#__PURE__*/React.createElement("h2", null, "Fees Management \u2014 ", CURRENT_TERM), /*#__PURE__*/React.createElement("div", {
@@ -7232,6 +7283,9 @@ function Fees({
   }, "Partial"), /*#__PURE__*/React.createElement("option", {
     value: "pending"
   }, "Pending")), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => setShowBulk(true)
+  }, "\u2699\uFE0F Bulk Set Fees"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
     onClick: () => setShowForm(true)
   }, "+ Record Payment"))), /*#__PURE__*/React.createElement("div", {
@@ -7266,7 +7320,47 @@ function Fees({
     style: {
       fontSize: '1.4rem'
     }
-  }, fmt(fees.reduce((a, f) => a + f.amount, 0))))), showForm && /*#__PURE__*/React.createElement("div", {
+  }, fmt(fees.reduce((a, f) => a + f.amount, 0))))), showBulk && /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      marginBottom: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "section-header"
+  }, /*#__PURE__*/React.createElement("h2", null, "\u2699\uFE0F Bulk Set Term Fees"), /*#__PURE__*/React.createElement("button", {
+    className: "close-btn",
+    onClick: () => setShowBulk(false)
+  }, "\xD7")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '0.8rem',
+      color: 'var(--text2)',
+      marginBottom: 12
+    }
+  }, "Creates a ", CURRENT_TERM, " fee record (balance = full amount, KES 0 paid) for every student in the selection who doesn't already have one. Existing records are never overwritten."), /*#__PURE__*/React.createElement("div", {
+    className: "form-grid"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "form-group"
+  }, /*#__PURE__*/React.createElement("label", null, "Grade"), /*#__PURE__*/React.createElement("select", {
+    value: bulkGrade,
+    onChange: e => setBulkGrade(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "all"
+  }, "All Grades (", students.length, " students)"), GRADES.map(g => /*#__PURE__*/React.createElement("option", {
+    key: g,
+    value: g
+  }, g, " (", students.filter(s => s.grade === g).length, " students)")))), /*#__PURE__*/React.createElement("div", {
+    className: "form-group"
+  }, /*#__PURE__*/React.createElement("label", null, "Fee Amount (KES)"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: bulkAmount,
+    onChange: e => setBulkAmount(e.target.value)
+  }))), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-gold",
+    onClick: bulkSetFees,
+    style: {
+      marginTop: 12
+    }
+  }, "Apply")), showForm && /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       marginBottom: 20
@@ -7717,6 +7811,57 @@ function ReceiptModal({
 }
 
 // ──────────── INVENTORY ────────────
+// Uniform stock from the school's inventory sheet (Aug 2026).
+// unitCost left at 0 pending confirmation of price-list mapping — see chat.
+// Prices confirmed against the school's Uniform Price List (Aug 2026) where the item
+// name and size band clearly matched. Wind Breaker, Green Shirt, and White Shirt have
+// no matching line in either price list — left at 0 pending confirmation, see chat.
+const UNIFORM_SEED = [
+  // 1. Wind Breaker - Junior Sec — no price list match found
+  { name: 'Wind Breaker - Junior Sec (Size 34)', qty: 25, unitCost: 0 },
+  { name: 'Wind Breaker - Junior Sec (Size 36)', qty: 57, unitCost: 0 },
+  { name: 'Wind Breaker - Junior Sec (Size 38)', qty: 20, unitCost: 0 },
+  // 2. Lower Primary Sweaters — matched to "Sweater Double Knit" (22-24:850, 26-28:900, 30-40:950)
+  { name: 'Lower Primary Sweater (Size 22)', qty: 8, unitCost: 850 },
+  { name: 'Lower Primary Sweater (Size 24)', qty: 5, unitCost: 850 },
+  { name: 'Lower Primary Sweater (Size 26)', qty: 9, unitCost: 900 },
+  { name: 'Lower Primary Sweater (Size 28)', qty: 22, unitCost: 900 },
+  { name: 'Lower Primary Sweater (Size 30)', qty: 3, unitCost: 950 },
+  { name: 'Lower Primary Sweater (Size 32)', qty: 10, unitCost: 950 },
+  { name: 'Lower Primary Sweater (Size 34)', qty: 13, unitCost: 950 },
+  { name: 'Lower Primary Sweater (Size 36)', qty: 19, unitCost: 950 },
+  // 3. Green Shirts — no confident price list match (only unsized "Shirts with Logo" 450 exists)
+  { name: 'Green Shirt (Size L)', qty: 3, unitCost: 0 },
+  { name: 'Green Shirt (Size XXL)', qty: 1, unitCost: 0 },
+  // 4. White Shirts — no confident price list match (only unsized "Shirts with Logo" 450 exists)
+  { name: 'White Shirt (Size S)', qty: 27, unitCost: 0 },
+  { name: 'White Shirt (Size M)', qty: 21, unitCost: 0 },
+  { name: 'White Shirt (Size L)', qty: 18, unitCost: 0 },
+  { name: 'White Shirt (Size XL)', qty: 7, unitCost: 0 },
+  // 5. Skirts — matched to Junior School "skirt" price list (24-26:750, 28-30:800)
+  { name: 'Skirt (Size 26)', qty: 20, unitCost: 750 },
+  { name: 'Skirt (Size 28)', qty: 24, unitCost: 800 },
+  // 7. Sweaters Junior Sec — same "Sweater Double Knit" line covers this size band (30-40:950)
+  { name: 'Sweater - Junior Sec (Size 36)', qty: 6, unitCost: 950 },
+  { name: 'Sweater - Junior Sec (Size 38)', qty: 4, unitCost: 950 },
+  // 8. Red Dresses — matched to "Dress" (22-24:500, 26-28:550, 30-32:600, 34-36:650, 38-40:700)
+  { name: 'Red Dress (Size 26)', qty: 5, unitCost: 550 },
+  { name: 'Red Dress (Size 28)', qty: 6, unitCost: 550 },
+  { name: 'Red Dress (Size 30)', qty: 9, unitCost: 600 },
+  { name: 'Red Dress (Size 32)', qty: 1, unitCost: 600 },
+  { name: 'Red Dress (Size 34)', qty: 6, unitCost: 650 },
+  { name: 'Red Dress (Size 36)', qty: 9, unitCost: 650 },
+  { name: 'Red Dress (Size 38)', qty: 9, unitCost: 700 },
+  // 9. Shorts — matched to "Shorts" (22-24:500, 26-28:550, 30-32:650, 34-36:750, 38-42:800)
+  { name: 'Shorts (Size 22)', qty: 2, unitCost: 500 },
+  { name: 'Shorts (Size 24)', qty: 18, unitCost: 500 },
+  { name: 'Shorts (Size 26)', qty: 8, unitCost: 550 },
+  { name: 'Shorts (Size 28)', qty: 21, unitCost: 550 },
+  { name: 'Shorts (Size 30)', qty: 3, unitCost: 650 },
+  { name: 'Shorts (Size 32)', qty: 7, unitCost: 650 },
+  { name: 'Shorts (Size 34)', qty: 1, unitCost: 750 }
+];
+
 function Inventory({
   inventory,
   setInventory,
@@ -7737,11 +7882,48 @@ function Inventory({
   const [editId, setEditId] = useState(null);
   const [adjustId, setAdjustId] = useState(null);
   const [adjQty, setAdjQty] = useState('');
-  const cats = ['Stationery', 'Furniture', 'Medical', 'Sports', 'Electronics', 'Other'];
+  const cats = ['Stationery', 'Furniture', 'Medical', 'Sports', 'Electronics', 'Uniforms', 'Other'];
   const filtered = inventory.filter(i => {
     const q = search.toLowerCase();
     return i.name.toLowerCase().includes(q) && (!catFilter || i.category === catFilter);
   });
+  const importUniforms = () => {
+    const existingNames = new Set(inventory.map(i => i.name));
+    const toAdd = UNIFORM_SEED.filter(u => !existingNames.has(u.name));
+    if (toAdd.length === 0) {
+      showToast('All uniform items already exist — use "Update Uniform Prices" to refresh pricing', 'gold');
+      return;
+    }
+    setInventory(prev => [...prev, ...toAdd.map(u => ({
+      id: 'I' + uid(),
+      name: u.name,
+      category: 'Uniforms',
+      qty: u.qty,
+      minQty: 5,
+      unit: 'pcs',
+      unitCost: u.unitCost || 0,
+      supplier: '',
+      lastUpdated: today()
+    }))]);
+    const priced = toAdd.filter(u => u.unitCost > 0).length;
+    showToast(`✅ Imported ${toAdd.length} uniform item(s), ${priced} with confirmed pricing.`);
+  };
+  const updateUniformPrices = () => {
+    const priceMap = new Map(UNIFORM_SEED.filter(u => u.unitCost > 0).map(u => [u.name, u.unitCost]));
+    let updatedCount = 0;
+    setInventory(prev => prev.map(i => {
+      if (priceMap.has(i.name) && i.unitCost !== priceMap.get(i.name)) {
+        updatedCount++;
+        return { ...i, unitCost: priceMap.get(i.name), lastUpdated: today() };
+      }
+      return i;
+    }));
+    if (updatedCount === 0) {
+      showToast('All uniform prices already match the confirmed price list', 'gold');
+    } else {
+      showToast(`✅ Updated pricing on ${updatedCount} uniform item(s).`);
+    }
+  };
   const save = () => {
     if (!form.name) {
       showToast('Name required', 'rose');
@@ -7828,6 +8010,12 @@ function Inventory({
   }, "All Categories"), cats.map(c => /*#__PURE__*/React.createElement("option", {
     key: c
   }, c))), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: importUniforms
+  }, "\uD83D\uDC55 Import Uniform Stock"), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: updateUniformPrices
+  }, "\uD83D\uDCB2 Update Uniform Prices"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
     onClick: () => {
       setShowForm(true);
@@ -9805,7 +9993,7 @@ const MSG_TEMPLATES = [{
   label: 'Fees Reminder',
   type: 'fees',
   subject: 'School Fees Payment Reminder – {term}',
-  body: 'Dear {parent},\n\nThis is a friendly reminder that school fees for {term} are due. Your child {student} ({grade}) has an outstanding balance of {balance}, expected to be cleared by {due_date}.\n\nPlease make payment at your earliest convenience. You may pay via M-Pesa, Bank Transfer, or Cash at the school office.\n\nThank you.\n\nTumaini Valley Springs'
+  body: 'Dear Parent,\n\nThis is a friendly reminder that school fees for {term} are due. Your child {student} ({grade}) has an outstanding balance of {balance}, expected to be cleared by {due_date}.\n\nPlease make payment at your earliest convenience. You may pay via M-Pesa, Bank Transfer, or Cash at the school office.\n\nThank you.\n\nTumaini Valley Springs'
 }, {
   label: 'General Announcement',
   type: 'general',
@@ -9984,6 +10172,7 @@ function Messaging({
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [aiStatus, setAiStatus] = useState(null); // null=checking, true=enabled, false=disabled
+  const [selectSearch, setSelectSearch] = useState('');
 
   useEffect(() => {
     fetch('/api/ping').then(r => r.json()).then(d => {
@@ -10376,7 +10565,15 @@ function Messaging({
     key: g
   }, g)))), form.recipients === 'selected' && /*#__PURE__*/React.createElement("div", {
     className: "form-group"
-  }, /*#__PURE__*/React.createElement("label", null, "Select Students"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("label", null, "Select Students"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    placeholder: "🔍 Search by parent, student, or phone…",
+    value: selectSearch,
+    onChange: e => setSelectSearch(e.target.value),
+    style: {
+      marginBottom: 8
+    }
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       background: 'var(--navy3)',
       borderRadius: 8,
@@ -10384,7 +10581,21 @@ function Messaging({
       maxHeight: 150,
       overflowY: 'auto'
     }
-  }, students.map(s => /*#__PURE__*/React.createElement("label", {
+  }, students.filter(s => {
+    const q = selectSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (s.name || '').toLowerCase().includes(q) || (s.parent || '').toLowerCase().includes(q) || (s.phone || '').includes(q) || (s.grade || '').toLowerCase().includes(q);
+  }).length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: 'var(--text2)',
+      fontSize: '0.8rem',
+      padding: 6
+    }
+  }, "No matches for \"", selectSearch, "\""), students.filter(s => {
+    const q = selectSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (s.name || '').toLowerCase().includes(q) || (s.parent || '').toLowerCase().includes(q) || (s.phone || '').includes(q) || (s.grade || '').toLowerCase().includes(q);
+  }).map(s => /*#__PURE__*/React.createElement("label", {
     key: s.id,
     style: {
       display: 'flex',
@@ -10410,7 +10621,7 @@ function Messaging({
     style: {
       color: 'var(--text2)'
     }
-  }, "(", s.grade, ") \xB7 ", s.phone))))), /*#__PURE__*/React.createElement("div", {
+  }, "(", s.grade, ") \xB7 ", s.parent, " \xB7 ", s.phone))))), /*#__PURE__*/React.createElement("div", {
     className: "form-group"
   }, /*#__PURE__*/React.createElement("label", null, "Message Type"), /*#__PURE__*/React.createElement("select", {
     value: form.type,
@@ -11477,9 +11688,10 @@ function AccessDenied() {
 }
 function AccountManager({
   session,
-  showToast
+  showToast,
+  accounts,
+  setAccounts
 }) {
-  const [accounts, setAccountsState] = useState(() => loadAccounts() || getDefaultAccounts());
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState({
@@ -11492,8 +11704,7 @@ function AccountManager({
   const [changingPin, setChangingPin] = useState(null); // userId for own PIN change
   const [newPin, setNewPin] = useState('');
   const persist = updated => {
-    saveAccounts(updated);
-    setAccountsState(updated);
+    setAccounts(updated);
   };
   const openNew = () => {
     setForm({
@@ -12581,7 +12792,9 @@ function ATSettings({
     }
   }, "How it works:"), " Every change auto-saves to cloud 3 seconds after you stop editing. When you open the app on another device, it loads the latest data from cloud automatically.")), /*#__PURE__*/React.createElement(AccountManager, {
     session: session,
-    showToast: showToast
+    showToast: showToast,
+    accounts: accounts,
+    setAccounts: setAccounts
   }), /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
