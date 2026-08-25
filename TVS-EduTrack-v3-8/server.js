@@ -1,14 +1,26 @@
 /**
- * Tumaini Valley Springs — EduTrack Server v4
+ * Tumaini Valley Springs — EduTrack Server v5
  * WebSocket sync + AI Composer + SMS/WhatsApp + Push Notifications
  *
  * Required env vars on Render:
  *   MONGODB_URI        — MongoDB Atlas connection string
- *   SYNC_SECRET        — Any password to protect sync
- *   GEMINI_API_KEY     — Google Gemini AI (for AI Message Composer)
- *   VAPID_PUBLIC_KEY   — BGrDmvlq-4UdRe3KciNtSC18JvoHFju-KgzzwAkFwUBrNBIafyrYLf9Yx1Vnd4NLQjmHUiov6aTbiPM8VY8y2Tg
- *   VAPID_PRIVATE_KEY  — q8t553rfS570qzHGnxpCppaFSPpKWgttXaqe503QGUs
- *   ADMIN_PHONE        — e.g. 254725347495 (no + or spaces)
+ *   SYNC_SECRET         — legacy device-pairing value (no longer sufficient for API access on its own)
+ *   SESSION_SECRET      — long random string used to sign login session tokens (set this!)
+ *   GEMINI_API_KEY      — Google Gemini AI (for AI Message Composer)
+ *   VAPID_PUBLIC_KEY    — generate your own with `node scripts/generate-vapid.js` (see below) — DO NOT reuse any key that has ever appeared in source control or chat
+ *   VAPID_PRIVATE_KEY   — see above
+ *   ADMIN_PHONE         — e.g. 254725347495 (no + or spaces)
+ *
+ * SECURITY NOTE (v5): Authentication used to be entirely client-side (a PIN
+ * checked in the browser) gated only by one shared secret known to every
+ * device. That meant anyone with the secret had full admin rights regardless
+ * of role, and the secret itself was being embedded in the client bundle at
+ * build time — visible to anyone via view-source. v5 replaces this with
+ * real server-verified accounts (scrypt-hashed PINs) and short-lived signed
+ * session tokens. Every account must have its PIN changed on first login.
+ * If your deploy pipeline substitutes a `__SYNC_SECRET__` value into the
+ * built HTML, stop doing that — no secret should ever ship inside a file
+ * served to the browser.
  */
 
 const express  = require('express');
@@ -16,6 +28,7 @@ const cors     = require('cors');
 const fetch    = require('node-fetch');
 const path     = require('path');
 const http     = require('http');
+const crypto   = require('crypto');
 const webpush  = require('web-push');
 const { WebSocketServer } = require('ws');
 const { MongoClient }     = require('mongodb');
@@ -24,27 +37,97 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocketServer({ server });
 
-const PORT          = process.env.PORT              || 3000;
-const MONGO_URI     = process.env.MONGODB_URI       || null;
-const SYNC_SECRET   = process.env.SYNC_SECRET       || 'edutrack-sync';
-const GEMINI_KEY = process.env.GEMINI_API_KEY || null;
-const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || null;
-const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || null;
+const PORT           = process.env.PORT              || 3000;
+const MONGO_URI      = process.env.MONGODB_URI       || null;
+const SYNC_SECRET    = process.env.SYNC_SECRET       || 'edutrack-sync';
+const SESSION_SECRET = process.env.SESSION_SECRET    || SYNC_SECRET;
+const GEMINI_KEY     = process.env.GEMINI_API_KEY    || null;
+const VAPID_PUBLIC   = process.env.VAPID_PUBLIC_KEY  || null;
+const VAPID_PRIVATE  = process.env.VAPID_PRIVATE_KEY || null;
+
+if (!process.env.SESSION_SECRET) {
+  console.warn('⚠️  SESSION_SECRET not set — falling back to SYNC_SECRET to sign login tokens. Set a dedicated SESSION_SECRET on Render.');
+}
 
 let adminPhone = process.env.ADMIN_PHONE || '';
 let db = null;
 
-const DB_NAME   = 'edutrack';
-const COLL_DATA = 'schooldata';
-const COLL_SUBS = 'pushsubscriptions';
-const COLL_CFG  = 'config';
+const DB_NAME     = 'edutrack';
+const COLL_DATA   = 'schooldata';
+const COLL_SUBS   = 'pushsubscriptions';
+const COLL_CFG    = 'config';
+const COLL_ACCTS  = 'accounts';
+
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12h
 
 // ── VAPID ─────────────────────────────────────────────────────────────────────
 if (VAPID_PUBLIC && VAPID_PRIVATE) {
   webpush.setVapidDetails('mailto:admin@tumainisprings.ac.ke', VAPID_PUBLIC, VAPID_PRIVATE);
 }
 
+// ── Password hashing (scrypt, built into Node — no extra dependency) ──────────
+function hashPin(pin) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(pin), salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+function verifyPin(pin, stored) {
+  if (!stored || typeof stored !== 'string' || !stored.includes(':')) return false;
+  const [salt, hash] = stored.split(':');
+  try {
+    const test = crypto.scryptSync(String(pin), salt, 64);
+    const orig = Buffer.from(hash, 'hex');
+    return test.length === orig.length && crypto.timingSafeEqual(test, orig);
+  } catch { return false; }
+}
+
+// ── Session tokens (HMAC-signed, no extra dependency) ──────────────────────────
+function b64url(input) { return Buffer.from(input).toString('base64url'); }
+function signToken(payload) {
+  const body = b64url(JSON.stringify(payload));
+  const sig  = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+function verifyToken(token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+  const [body, sig] = token.split('.');
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  const sigBuf = Buffer.from(sig || '', 'base64url'), expBuf = Buffer.from(expected, 'base64url');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (!payload.exp || Date.now() > payload.exp) return null;
+    return payload;
+  } catch { return null; }
+}
+function authToken(roles) {
+  return (req, res, next) => {
+    const header = req.headers['authorization'] || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query.token || null);
+    const payload = verifyToken(token);
+    if (!payload) return res.status(401).json({ error: 'Unauthorized — please log in again' });
+    if (roles && roles.length && !roles.includes(payload.role)) return res.status(403).json({ error: 'Forbidden for your role' });
+    req.user = payload;
+    next();
+  };
+}
+
 // ── MongoDB ───────────────────────────────────────────────────────────────────
+async function ensureDefaultAccounts() {
+  if (!db) return;
+  try {
+    const count = await db.collection(COLL_ACCTS).countDocuments();
+    if (count === 0) {
+      const now = new Date().toISOString();
+      await db.collection(COLL_ACCTS).insertMany([
+        { _id: 'U1', username: 'admin',   pinHash: hashPin('1234'), role: 'admin',   name: 'Administrator', active: true, mustChangePin: true, createdAt: now },
+        { _id: 'U2', username: 'teacher', pinHash: hashPin('5678'), role: 'teacher', name: 'Class Teacher',  active: true, mustChangePin: true, createdAt: now },
+      ]);
+      console.log('⚠️  Seeded default accounts (admin/1234, teacher/5678) — each MUST change its PIN on first login.');
+    }
+  } catch (e) { console.error('❌ Account seed check failed:', e.message); }
+}
+
 async function connectMongo() {
   if (!MONGO_URI) { console.log('⚠️  MONGODB_URI not set.'); return; }
   try {
@@ -56,48 +139,65 @@ async function connectMongo() {
       const cfg = await db.collection(COLL_CFG).findOne({ _id: 'adminPhone' }).catch(() => null);
       if (cfg) adminPhone = cfg.value;
     }
+    await ensureDefaultAccounts();
     startAlertScheduler();
   } catch (e) { console.error('❌ MongoDB failed:', e.message); }
 }
 connectMongo();
 
+app.set('trust proxy', 1); // Render sits behind a proxy — needed for req.ip to reflect the real client
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Rate limit ────────────────────────────────────────────────────────────────
+// ── Rate limit (keyed on the real client IP, not a spoofable header) ──────────
 const rlMap = new Map();
 function rateLimit(req, res, next) {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'x';
+  const ip = req.ip || 'x';
   const now = Date.now();
   const d   = rlMap.get(ip) || { count: 0, start: now };
   if (now - d.start > 60000) { rlMap.set(ip, { count: 1, start: now }); return next(); }
   if (d.count >= 120) return res.status(429).json({ error: 'Too many requests' });
   d.count++; rlMap.set(ip, d); next();
 }
-function authSync(req, res, next) {
-  const s = req.headers['x-sync-secret'] || req.query.secret;
-  if (s !== SYNC_SECRET) return res.status(401).json({ error: 'Unauthorized' });
-  next();
+// Tighter limit specifically for login attempts, keyed by IP + username
+const loginAttempts = new Map();
+function loginRateLimit(req, res, next) {
+  const key = (req.ip || 'x') + ':' + String(req.body?.username || '').toLowerCase();
+  const now = Date.now();
+  const d = loginAttempts.get(key) || { count: 0, start: now };
+  if (now - d.start > 300000) { loginAttempts.set(key, { count: 1, start: now }); return next(); }
+  if (d.count >= 10) return res.status(429).json({ error: 'Too many login attempts — try again in a few minutes' });
+  d.count++; loginAttempts.set(key, d); next();
 }
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+// ── WebSocket (auth via first message, never via URL query string) ────────────
 const clients = new Set();
-wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  if (url.searchParams.get('secret') !== SYNC_SECRET) { ws.close(4001, 'Unauthorized'); return; }
-  clients.add(ws);
-  if (db) {
-    db.collection(COLL_DATA).findOne({ _id: 'main' }).then(doc => {
-      if (doc && ws.readyState === ws.OPEN) {
-        const { _id, ...data } = doc;
-        ws.send(JSON.stringify({ type: 'snapshot', data, savedAt: doc.savedAt }));
-      }
-    }).catch(() => {});
-  }
-  ws.on('close', () => clients.delete(ws));
-  ws.on('error', () => clients.delete(ws));
+wss.on('connection', (ws) => {
+  let authed = false;
+  const timer = setTimeout(() => { if (!authed) ws.close(4001, 'Unauthorized'); }, 5000);
+  ws.once('message', (raw) => {
+    clearTimeout(timer);
+    let payload = null;
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg && msg.type === 'auth') payload = verifyToken(msg.token);
+    } catch {}
+    if (!payload) { ws.close(4001, 'Unauthorized'); return; }
+    authed = true;
+    clients.add(ws);
+    ws.on('close', () => clients.delete(ws));
+    ws.on('error', () => clients.delete(ws));
+    if (db) {
+      db.collection(COLL_DATA).findOne({ _id: 'main' }).then(doc => {
+        if (doc && ws.readyState === ws.OPEN) {
+          const { _id, ...data } = doc;
+          ws.send(JSON.stringify({ type: 'snapshot', data, savedAt: doc.savedAt }));
+        }
+      }).catch(() => {});
+    }
+  });
 });
 function broadcast(data, savedAt) {
   const p = JSON.stringify({ type: 'update', data, savedAt });
@@ -110,7 +210,7 @@ async function sendPushToAll(title, body, tag = 'tvs-alert') {
   const subs = await db.collection(COLL_SUBS).find({}).toArray().catch(() => []);
   const payload = JSON.stringify({ title, body, icon: '/icons/icon-192.png', tag });
   const dead = [];
-  await Promise.allSettled(subs.map(async (sub, i) => {
+  await Promise.allSettled(subs.map(async (sub) => {
     try { await webpush.sendNotification(sub.subscription, payload); }
     catch (e) { if (e.statusCode === 410 || e.statusCode === 404) dead.push(sub._id); }
   }));
@@ -131,9 +231,11 @@ async function sendSMS(to, message, cfg = {}) {
     await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', apiKey, Accept: 'application/json' }, body: params.toString() });
   } catch {}
 }
+// AT credentials now live only in a protected config doc — never in the
+// shared schooldata document, and never broadcast to connected clients.
 async function getATConfig() {
   if (!db) return null;
-  try { const doc = await db.collection(COLL_DATA).findOne({ _id: 'main' }); return doc?.atConfig || null; } catch { return null; }
+  try { const doc = await db.collection(COLL_CFG).findOne({ _id: 'atConfig' }); return doc?.value || null; } catch { return null; }
 }
 
 // ── Alert checks ──────────────────────────────────────────────────────────────
@@ -205,8 +307,67 @@ app.get('/api/ping', (req, res) => res.json({
   time:     new Date().toISOString()
 }));
 
-// Sync load
-app.get('/api/sync', authSync, async (req, res) => {
+// ── Auth ────────────────────────────────────────────────────────────────────
+app.post('/api/auth/login', loginRateLimit, async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  const { username, pin } = req.body || {};
+  if (!username || !pin) return res.status(400).json({ error: 'Username and PIN required' });
+  try {
+    const user = await db.collection(COLL_ACCTS).findOne({ username: String(username).trim().toLowerCase(), active: true });
+    if (!user || !verifyPin(pin, user.pinHash)) return res.status(401).json({ error: 'Incorrect username or PIN' });
+    const token = signToken({ id: user._id, username: user.username, role: user.role, name: user.name, exp: Date.now() + SESSION_TTL_MS });
+    res.json({ ok: true, token, user: { id: user._id, username: user.username, role: user.role, name: user.name }, mustChangePin: !!user.mustChangePin });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/change-pin', authToken(), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  const { newPin } = req.body || {};
+  if (!newPin || String(newPin).trim().length < 4) return res.status(400).json({ error: 'PIN must be at least 4 characters' });
+  try {
+    await db.collection(COLL_ACCTS).updateOne({ _id: req.user.id }, { $set: { pinHash: hashPin(newPin), mustChangePin: false } });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: list / create / update accounts (PIN hashes are never returned)
+app.get('/api/accounts', authToken(['admin']), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  try {
+    const list = await db.collection(COLL_ACCTS).find({}, { projection: { pinHash: 0 } }).toArray();
+    res.json({ ok: true, accounts: list });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/accounts', authToken(['admin']), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  const { id, username, pin, role, name, active } = req.body || {};
+  if (!username || !role || !name) return res.status(400).json({ error: 'username, role and name are required' });
+  if (!['admin', 'teacher', 'viewer'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+  try {
+    const _id = id || ('U' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+    const update = { username: String(username).trim().toLowerCase(), role, name, active: active !== false };
+    if (pin) { update.pinHash = hashPin(pin); update.mustChangePin = true; }
+    await db.collection(COLL_ACCTS).updateOne(
+      { _id },
+      { $set: update, $setOnInsert: { createdAt: new Date().toISOString() } },
+      { upsert: true }
+    );
+    res.json({ ok: true, id: _id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/accounts/:id', authToken(['admin']), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  if (req.params.id === req.user.id) return res.status(400).json({ error: "Can't delete your own account" });
+  try {
+    await db.collection(COLL_ACCTS).deleteOne({ _id: req.params.id });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Sync (now requires a real logged-in session, not just the shared secret) ──
+app.get('/api/sync', authToken(), async (req, res) => {
   if (!db) return res.status(503).json({ error: 'No database' });
   try {
     const doc = await db.collection(COLL_DATA).findOne({ _id: 'main' });
@@ -216,73 +377,94 @@ app.get('/api/sync', authSync, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Sync save
-app.post('/api/sync', authSync, async (req, res) => {
+app.post('/api/sync', authToken(['admin', 'teacher']), async (req, res) => {
   if (!db) return res.status(503).json({ error: 'No database' });
-  const { data } = req.body;
-  if (!data) return res.status(400).json({ error: 'Missing data' });
+  const { data } = req.body || {};
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ error: 'Missing or invalid data' });
+  // AT credentials must never live in the shared/broadcast document.
+  const { atConfig, ...safeData } = data;
   try {
     const savedAt = new Date().toISOString();
-    await db.collection(COLL_DATA).replaceOne({ _id: 'main' }, { _id: 'main', ...data, savedAt }, { upsert: true });
+    await db.collection(COLL_DATA).replaceOne({ _id: 'main' }, { _id: 'main', ...safeData, savedAt }, { upsert: true });
     res.json({ ok: true, savedAt });
-    broadcast(data, savedAt);
-    if (data.adminPhone) {
-      adminPhone = data.adminPhone;
-      db.collection(COLL_CFG).replaceOne({ _id: 'adminPhone' }, { _id: 'adminPhone', value: data.adminPhone }, { upsert: true }).catch(() => {});
+    broadcast(safeData, savedAt);
+    if (safeData.adminPhone) {
+      adminPhone = safeData.adminPhone;
+      db.collection(COLL_CFG).replaceOne({ _id: 'adminPhone' }, { _id: 'adminPhone', value: safeData.adminPhone }, { upsert: true }).catch(() => {});
     }
-    setImmediate(() => runAlertCheck(data).catch(() => {}));
+    if (atConfig && req.user.role === 'admin') {
+      db.collection(COLL_CFG).replaceOne({ _id: 'atConfig' }, { _id: 'atConfig', value: atConfig }, { upsert: true }).catch(() => {});
+    }
+    setImmediate(() => runAlertCheck(safeData).catch(() => {}));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Reset all data
-app.post('/api/reset', authSync, async (req, res) => {
+// Admin-only: read/write the Africa's Talking credentials directly (never synced to all clients)
+app.get('/api/at-config', authToken(['admin']), async (req, res) => {
   if (!db) return res.status(503).json({ error: 'No database' });
+  try { res.json({ ok: true, config: await getATConfig() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/at-config', authToken(['admin']), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  const { config } = req.body || {};
+  if (!config || typeof config !== 'object') return res.status(400).json({ error: 'Missing config' });
   try {
-    await db.collection(COLL_DATA).deleteOne({ _id: 'main' });
-    broadcast({}, new Date().toISOString());
+    await db.collection(COLL_CFG).replaceOne({ _id: 'atConfig' }, { _id: 'atConfig', value: config }, { upsert: true });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Push: get VAPID public key
+// Reset all data — admin only, requires explicit confirmation flag
+app.post('/api/reset', authToken(['admin']), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'No database' });
+  if (req.body?.confirm !== true) return res.status(400).json({ error: 'Confirmation required' });
+  try {
+    await db.collection(COLL_DATA).deleteOne({ _id: 'main' });
+    broadcast({}, new Date().toISOString());
+    console.log(`[Reset] Data wiped by admin "${req.user.username}" at ${new Date().toISOString()}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Push: get VAPID public key (safe to expose — it's the public half)
 app.get('/api/push/vapid-public-key', (req, res) => {
   if (!VAPID_PUBLIC) return res.status(503).json({ error: 'VAPID not configured' });
   res.json({ key: VAPID_PUBLIC });
 });
 
-// Push: subscribe
-app.post('/api/push/subscribe', authSync, async (req, res) => {
+// Push: subscribe / unsubscribe / test — all require a logged-in session
+app.post('/api/push/subscribe', authToken(), async (req, res) => {
   if (!VAPID_PUBLIC || !db) return res.status(503).json({ error: 'Push not configured' });
   const { subscription, deviceLabel } = req.body;
   if (!subscription?.endpoint) return res.status(400).json({ error: 'Invalid subscription' });
   try {
     await db.collection(COLL_SUBS).replaceOne(
       { 'subscription.endpoint': subscription.endpoint },
-      { subscription, deviceLabel: deviceLabel || 'Unknown', registeredAt: new Date().toISOString() },
+      { subscription, deviceLabel: deviceLabel || 'Unknown', registeredAt: new Date().toISOString(), registeredBy: req.user.username },
       { upsert: true }
     );
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Push: unsubscribe
-app.post('/api/push/unsubscribe', authSync, async (req, res) => {
+app.post('/api/push/unsubscribe', authToken(), async (req, res) => {
   const { endpoint } = req.body;
   if (!db || !endpoint) return res.status(400).json({ error: 'Missing endpoint' });
   try { await db.collection(COLL_SUBS).deleteOne({ 'subscription.endpoint': endpoint }); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Push: test
-app.post('/api/push/test', authSync, async (req, res) => {
+app.post('/api/push/test', authToken(), async (req, res) => {
   if (!VAPID_PUBLIC) return res.status(503).json({ error: 'Push not configured' });
   await sendPushToAll('✅ TVS EduTrack', 'Push notifications working! You will receive alerts for insurance, stock and logins.', 'tvs-test');
   res.json({ ok: true });
 });
 
 // Login notification
-app.post('/api/notify/login', authSync, async (req, res) => {
-  const { username, role, deviceHint } = req.body;
+app.post('/api/notify/login', authToken(), async (req, res) => {
+  const { deviceHint } = req.body || {};
+  const username = req.user.username, role = req.user.role;
   const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
   const msg  = `🔐 TVS Login: ${username} (${role}) at ${time}${deviceHint ? ' — ' + deviceHint : ''}`;
   await sendPushToAll('🔐 TVS Login', `${username} (${role}) signed in at ${time}`, 'tvs-login');
@@ -291,14 +473,14 @@ app.post('/api/notify/login', authSync, async (req, res) => {
 });
 
 // Manual alert check
-app.post('/api/notify/check', authSync, async (req, res) => {
+app.post('/api/notify/check', authToken(), async (req, res) => {
   const { data } = req.body;
-  const alerts = await runAlertCheck(data || {}).catch(e => []);
+  const alerts = await runAlertCheck(data || {}).catch(() => []);
   res.json({ ok: true, alerts });
 });
 
-// AI Composer
-app.post('/api/ai-compose', rateLimit, async (req, res) => {
+// AI Composer — requires login now (previously open to anyone on the internet)
+app.post('/api/ai-compose', authToken(), rateLimit, async (req, res) => {
   if (!GEMINI_KEY) return res.status(503).json({ error: 'Set GEMINI_API_KEY on Render.' });
   const { prompt, term, gradeContext } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: 'Prompt required' });
@@ -342,8 +524,8 @@ app.post('/api/ai-compose', rateLimit, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// SMS proxy
-app.post('/api/sms', rateLimit, async (req, res) => {
+// SMS proxy — requires login (previously an open relay usable by anyone with an AT key)
+app.post('/api/sms', authToken(), rateLimit, async (req, res) => {
   const { apiKey, username, to, message, from } = req.body;
   if (!apiKey || !to || !message) return res.status(400).json({ error: 'Missing fields' });
   const sandbox  = username === 'sandbox';
@@ -357,8 +539,8 @@ app.post('/api/sms', rateLimit, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// WhatsApp proxy
-app.post('/api/whatsapp', rateLimit, async (req, res) => {
+// WhatsApp proxy — requires login
+app.post('/api/whatsapp', authToken(), rateLimit, async (req, res) => {
   const { apiKey, username, to, message, from } = req.body;
   if (!apiKey || !to || !message) return res.status(400).json({ error: 'Missing fields' });
   const sandbox  = username === 'sandbox';
@@ -376,7 +558,7 @@ app.use((req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n╔══════════════════════════════════════╗`);
-  console.log(`║  TVS EduTrack Server v4               ║`);
+  console.log(`║  TVS EduTrack Server v5               ║`);
   console.log(`╚══════════════════════════════════════╝`);
   console.log(`  Port:  ${PORT}`);
   console.log(`  Sync:  ${MONGO_URI     ? '✅ MongoDB'  : '⚠️  No DB'}`);
