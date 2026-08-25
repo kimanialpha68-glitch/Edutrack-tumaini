@@ -1166,17 +1166,16 @@ function saveSyncConfig(cfg) {
 // Keys that are saved/restored during cloud sync
 const SYNC_KEYS = ['students', 'fees', 'inventory', 'vehicles', 'routes', 'fueling', 'repairs', 'alumni', 'exams', 'messages'];
 async function cloudPush(data, cfg) {
-  if (!cfg.proxyUrl || !cfg.syncSecret) return {
+  if (!cfg.proxyUrl || !loadAuthToken()) return {
     ok: false,
-    error: 'Sync not configured'
+    error: 'Not signed in'
   };
   try {
     const r = await fetch(`${cfg.proxyUrl}/api/sync`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-sync-secret': cfg.syncSecret
-      },
+      headers: authHeaders({
+        'Content-Type': 'application/json'
+      }),
       body: JSON.stringify({
         data
       })
@@ -1201,15 +1200,13 @@ async function cloudPush(data, cfg) {
   }
 }
 async function cloudPull(cfg) {
-  if (!cfg.proxyUrl || !cfg.syncSecret) return {
+  if (!cfg.proxyUrl || !loadAuthToken()) return {
     ok: false,
-    error: 'Sync not configured'
+    error: 'Not signed in'
   };
   try {
     const r = await fetch(`${cfg.proxyUrl}/api/sync`, {
-      headers: {
-        'x-sync-secret': cfg.syncSecret
-      }
+      headers: authHeaders()
     });
     if (!r.ok) {
       const e = await r.json();
@@ -1301,6 +1298,42 @@ function saveSession(user) {
 function clearSession() {
   sessionStorage.removeItem(AUTH_KEY + '_session');
 }
+// Session tokens are kept separately from the session display object so we
+// never accidentally sync/export/log them alongside ordinary app data.
+function saveAuthToken(token) {
+  if (token) sessionStorage.setItem(AUTH_KEY + '_token', token);
+}
+function loadAuthToken() {
+  return sessionStorage.getItem(AUTH_KEY + '_token') || null;
+}
+function clearAuthToken() {
+  sessionStorage.removeItem(AUTH_KEY + '_token');
+}
+// Standard header for any call to a protected server endpoint.
+function authHeaders(extra = {}) {
+  const token = loadAuthToken();
+  return token ? { ...extra, Authorization: 'Bearer ' + token } : extra;
+}
+// Local-only cache of this device's own login (username/role/weak local PIN
+// check) used strictly as an OFFLINE fallback when the server can't be
+// reached. It is never populated with other users' accounts and is never
+// synced anywhere — the server-verified login above is always authoritative
+// whenever the network is available.
+function cacheOfflineLogin(username, pin, user) {
+  try {
+    const cache = JSON.parse(localStorage.getItem(AUTH_KEY + '_offline_cache') || '{}');
+    cache[username.toLowerCase()] = { pinHash: hashPin(pin), user };
+    localStorage.setItem(AUTH_KEY + '_offline_cache', JSON.stringify(cache));
+  } catch {}
+}
+function checkOfflineLogin(username, pin) {
+  try {
+    const cache = JSON.parse(localStorage.getItem(AUTH_KEY + '_offline_cache') || '{}');
+    const entry = cache[username.toLowerCase()];
+    if (entry && entry.pinHash === hashPin(pin)) return entry.user;
+  } catch {}
+  return null;
+}
 
 // ──────────── LOGIN PAGE ────────────
 function LoginPage({
@@ -1311,56 +1344,107 @@ function LoginPage({
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPin, setShowPin] = useState(false);
-  const [checkingAccounts, setCheckingAccounts] = useState(true);
-  React.useEffect(() => {
-    // Pull the latest accounts from the cloud before allowing login, so a staff
-    // member whose account was created on a different device can log in here too.
-    // Capped at 4s so a slow/offline connection never blocks login for long —
-    // falls back to whatever accounts are already cached on this device.
-    const cfg = getSyncConfig();
-    const timeout = new Promise(resolve => setTimeout(() => resolve({ ok: false }), 4000));
-    Promise.race([cloudPull(cfg), timeout]).then(result => {
-      if (result.ok && result.data && result.data.accounts) {
-        saveAccounts(result.data.accounts);
-      }
-    }).catch(() => {}).finally(() => setCheckingAccounts(false));
-  }, []);
-  const submit = () => {
+  const checkingAccounts = false;
+  // Forced PIN-change step — shown after a valid login when the server
+  // reports this account still has a default/temporary PIN.
+  const [pendingAuth, setPendingAuth] = useState(null); // { token, user }
+  const [newPin, setNewPin] = useState('');
+  const [newPin2, setNewPin2] = useState('');
+  const finishLogin = (user, token, offline) => {
+    const session = {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+      loginAt: new Date().toISOString(),
+      offline: !!offline
+    };
+    saveSession(session);
+    if (token) saveAuthToken(token);
+    onLogin(session);
+  };
+  const submit = async () => {
     setError('');
-    if (!username.trim()) {
-      setError('Enter your username.');
-      return;
-    }
-    if (!pin.trim()) {
-      setError('Enter your PIN.');
-      return;
-    }
+    const uname = username.trim();
+    if (!uname) { setError('Enter your username.'); return; }
+    if (!pin.trim()) { setError('Enter your PIN.'); return; }
     setLoading(true);
-    setTimeout(() => {
-      const accounts = loadAccounts() || getDefaultAccounts();
-      const user = accounts.find(a => a.username.toLowerCase() === username.trim().toLowerCase() && a.active);
-      if (!user) {
-        setError('Username not found.');
-        setLoading(false);
-        return;
-      }
-      if (user.pinHash !== hashPin(pin)) {
-        setError('Incorrect PIN. Try again.');
+    const cfg = getSyncConfig();
+    try {
+      const r = await fetch(`${cfg.proxyUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: uname, pin })
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setError(d.error || 'Login failed.');
         setLoading(false);
         setPin('');
         return;
       }
-      const session = {
-        id: user.id,
-        username: user.username,
-        name: user.name,
-        role: user.role,
-        loginAt: new Date().toISOString()
-      };
-      saveSession(session);
-      onLogin(session);
-    }, 400);
+      // Cache this device's own successful login locally, for offline access only.
+      cacheOfflineLogin(uname, pin, d.user);
+      setLoading(false);
+      if (d.mustChangePin) {
+        setPendingAuth({ token: d.token, user: d.user });
+        return;
+      }
+      finishLogin(d.user, d.token, false);
+    } catch (netErr) {
+      // Server unreachable — fall back to this device's own cached login only.
+      const cached = checkOfflineLogin(uname, pin);
+      setLoading(false);
+      if (!cached) {
+        setError('Server unreachable and no offline login cached on this device. Connect once online, then try again.');
+        setPin('');
+        return;
+      }
+      finishLogin(cached, null, true);
+    }
   };
+  const submitNewPin = async () => {
+    setError('');
+    if (!newPin.trim() || newPin.trim().length < 4) { setError('New PIN must be at least 4 characters.'); return; }
+    if (newPin !== newPin2) { setError('PINs do not match.'); return; }
+    setLoading(true);
+    try {
+      const cfg = getSyncConfig();
+      const r = await fetch(`${cfg.proxyUrl}/api/auth/change-pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + pendingAuth.token },
+        body: JSON.stringify({ newPin })
+      });
+      const d = await r.json().catch(() => ({}));
+      setLoading(false);
+      if (!r.ok) { setError(d.error || 'Could not update PIN.'); return; }
+      cacheOfflineLogin(pendingAuth.user.username, newPin, pendingAuth.user);
+      finishLogin(pendingAuth.user, pendingAuth.token, false);
+    } catch {
+      setLoading(false);
+      setError('Server unreachable — connect to change your PIN.');
+    }
+  };
+  if (pendingAuth) {
+    return /*#__PURE__*/React.createElement("div", { className: "login-page" }, /*#__PURE__*/React.createElement("div", { className: "login-card" },
+      /*#__PURE__*/React.createElement("div", { className: "login-header" },
+        /*#__PURE__*/React.createElement("h1", null, "Set a new PIN"),
+        /*#__PURE__*/React.createElement("p", null, "This account is still using its default PIN. Choose a new one to continue.")
+      ),
+      /*#__PURE__*/React.createElement("div", { className: "login-body" },
+        error && /*#__PURE__*/React.createElement("div", { className: "login-error" }, "\u26A0\uFE0F ", error),
+        /*#__PURE__*/React.createElement("div", { className: "login-field" },
+          /*#__PURE__*/React.createElement("label", null, "New PIN"),
+          /*#__PURE__*/React.createElement("input", { type: "password", value: newPin, onChange: e => setNewPin(e.target.value), inputMode: "numeric", maxLength: 8, autoFocus: true })
+        ),
+        /*#__PURE__*/React.createElement("div", { className: "login-field" },
+          /*#__PURE__*/React.createElement("label", null, "Confirm New PIN"),
+          /*#__PURE__*/React.createElement("input", { type: "password", value: newPin2, onChange: e => setNewPin2(e.target.value), inputMode: "numeric", maxLength: 8, onKeyDown: e => e.key === 'Enter' && submitNewPin() })
+        ),
+        /*#__PURE__*/React.createElement("button", { className: "login-btn", onClick: submitNewPin, disabled: loading }, loading ? '⏳ Saving…' : '✅ Set PIN & Continue')
+      )
+    ));
+  }
   const handleKey = e => {
     if (e.key === 'Enter') submit();
   };
@@ -1437,7 +1521,7 @@ function LoginPage({
 // ── Push notification registration ───────────────────────────────────────────
 async function registerPushSubscription(cfg) {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-  if (!cfg.proxyUrl || !cfg.syncSecret) return;
+  if (!cfg.proxyUrl || !loadAuthToken()) return;
   try {
     // Get VAPID public key from server
     const keyRes = await fetch(`${cfg.proxyUrl}/api/push/vapid-public-key`);
@@ -1458,7 +1542,7 @@ async function registerPushSubscription(cfg) {
     // Register with server
     await fetch(`${cfg.proxyUrl}/api/push/subscribe`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-sync-secret': cfg.syncSecret },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         subscription: sub.toJSON(),
         deviceLabel: `${navigator.userAgent.includes('Mobile') ? 'Mobile' : 'Desktop'} — ${new Date().toLocaleDateString()}`
@@ -1488,9 +1572,10 @@ function Root() {
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
   const handleLogin = s => {
     setSession(s);
+    if (s.offline) return; // offline fallback login — nothing to sync/notify yet
     // Auto-pull from cloud immediately after login on any device
     const cfg = getSyncConfig();
-    if (cfg.proxyUrl && cfg.syncSecret) {
+    if (cfg.proxyUrl && loadAuthToken()) {
       cloudPull(cfg).then(result => {
         if (result.ok && result.data) {
           const d = result.data;
@@ -1505,7 +1590,7 @@ function Root() {
       // Notify server of login (triggers SMS + push to admin)
       fetch(`${cfg.proxyUrl}/api/notify/login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-sync-secret': cfg.syncSecret },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           username: s.username,
           role: s.role,
@@ -1519,6 +1604,7 @@ function Root() {
   };
   const handleLogout = () => {
     clearSession();
+    clearAuthToken();
     setSession(null);
   };
   if (!session) return /*#__PURE__*/React.createElement(LoginPage, {
@@ -1543,11 +1629,13 @@ function App({
   const [students, setStudents] = usePersist('students', initStudents);
   const [fees, setFees] = usePersist('fees', initFees);
 
-  // ── Migration: fix term + merge duplicate records + add paymentHistory ──
+  // ── Migration: fill in missing term + merge true duplicate records + add paymentHistory ──
+  // NOTE: this must NEVER reassign a term a record already has — each fee record is scoped to
+  // the term it was actually paid for, and student profiles/history rely on that staying intact.
   React.useEffect(() => {
     setFees(prev => {
-      // Step 1: update all terms to current
-      let updated = prev.map(f => f.term !== CURRENT_TERM ? { ...f, term: CURRENT_TERM } : f);
+      // Step 1: only fill in a term if one is genuinely missing — never overwrite an existing term
+      let updated = prev.map(f => f.term ? f : { ...f, term: CURRENT_TERM });
 
       // Step 2: ensure every record has paymentHistory
       updated = updated.map(f => ({
@@ -1555,7 +1643,7 @@ function App({
         paymentHistory: f.paymentHistory || [{ date: f.date || '', amount: f.paid || 0, method: f.method || '', ref: f.ref || '' }]
       }));
 
-      // Step 3: merge duplicate records (same studentId + term) into one cumulative record
+      // Step 3: merge true duplicate records (same studentId + same term) into one cumulative record
       const merged = [];
       const seen = new Map(); // key: studentId_term → index in merged
       for (const f of updated) {
@@ -1638,8 +1726,9 @@ function App({
   });
   const [adminPhone, setAdminPhone] = usePersist('adminPhone', '');
   const [feeDueDate, setFeeDueDate] = usePersist('feeDueDate', '');
-  // Accounts share AUTH_KEY storage (same key LoginPage reads) so both stay in sync —
-  // included in collectData() below so account changes propagate to other devices.
+  // Accounts are managed server-side via /api/accounts (scrypt-hashed PINs) and are
+  // no longer part of collectData()/sync — this local copy is just a display cache
+  // for the AccountManager UI, refreshed from the server on mount.
   const [accounts, setAccountsState] = useState(() => loadAccounts() || getDefaultAccounts());
   const setAccounts = React.useCallback(updater => {
     setAccountsState(prev => {
@@ -1663,7 +1752,11 @@ function App({
     setSyncConfigState(cfg);
   };
 
-  // Collect all current data into one object
+  // Collect all current data into one object.
+  // NOTE: login `accounts` are deliberately excluded — they're managed
+  // server-side via /api/accounts now, and must never travel through the
+  // shared sync/broadcast channel (their old inclusion here meant every
+  // connected device received every other user's PIN hash in real time).
   const collectData = React.useCallback(() => ({
     students,
     fees,
@@ -1674,9 +1767,8 @@ function App({
     repairs,
     alumni,
     exams,
-    messages,
-    accounts
-  }), [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages, accounts]);
+    messages
+  }), [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
 
   // ── Real-time WebSocket sync — refs & helpers ─────────────────────────────
   const suppressNextPushRef = React.useRef(false);
@@ -1698,7 +1790,6 @@ function App({
     if (d.alumni)    setAlumni(d.alumni);
     if (d.exams)     setExams(d.exams);
     if (d.messages)  setMessages(d.messages);
-    if (d.accounts)  setAccounts(d.accounts);
     const ts = new Date().toLocaleString();
     setLastSync(ts);
     localStorage.setItem('edutrack_last_sync', ts);
@@ -1706,31 +1797,21 @@ function App({
     setSyncMsg(`Live update received ${new Date().toLocaleTimeString()}`);
   }, [setStudents, setFees, setInventory, setVehicles, setRoutes, setFueling, setRepairs, setAlumni, setExams, setMessages, setAccounts]);
 
-  // Debounced auto-push — fires 3s after last change
+  // Manual-only sync: local changes are marked as "unsynced" but never pushed automatically.
+  // The only way data reaches the server is the explicit "Push to Cloud" button (manualPush).
+  // (v5 note preserved: cloudPush() itself never silently swallows a missing/expired auth
+  // token — it always returns a proper error object, which manualPush surfaces visibly via
+  // syncStatus + a toast. That's still true here; it's just no longer triggered on a timer.)
   const schedulePush = React.useCallback(() => {
-    if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
-    clearTimeout(syncTimer.current);
+    if (!syncConfig.proxyUrl) return;
+    clearTimeout(syncTimer.current); // no-op now, kept in case anything still references syncTimer
     setSyncStatus('pending');
-    syncTimer.current = setTimeout(async () => {
-      setSyncStatus('syncing');
-      const result = await cloudPush(collectData(), syncConfig);
-      if (result.ok) {
-        setSyncStatus('ok');
-        setSyncMsg(`Synced ${new Date().toLocaleTimeString()}`);
-        const ts = new Date().toLocaleString();
-        setLastSync(ts);
-        localStorage.setItem('edutrack_last_sync', ts);
-        if (result.savedAt) lastSavedAtRef.current = result.savedAt;
-      } else {
-        setSyncStatus('error');
-        setSyncMsg(result.error || 'Sync failed');
-      }
-    }, 1500);
-  }, [syncConfig, collectData]);
+    setSyncMsg('Unsynced changes — tap Push to Cloud to save');
+  }, [syncConfig]);
 
   // Immediate push — used for destructive operations (delete, clear)
   const immediatePush = React.useCallback(async (overrideData) => {
-    if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
+    if (!syncConfig.proxyUrl) return;
     clearTimeout(syncTimer.current); // cancel any pending debounce
     setSyncStatus('syncing');
     const result = await cloudPush(overrideData || collectData(), syncConfig);
@@ -1747,29 +1828,18 @@ function App({
     }
   }, [syncConfig, collectData]);
 
-  // Flush pending sync before page unload
+  // Manual-only sync: don't silently push on tab close. Instead warn the user they have
+  // unsynced changes so they can go back and tap "Push to Cloud" themselves.
   React.useEffect(() => {
-    const flush = () => {
-      if (syncStatus === 'pending' && syncConfig.proxyUrl && syncConfig.syncSecret) {
-        clearTimeout(syncTimer.current);
-        const data = collectData();
-        const body = JSON.stringify({ data });
-        navigator.sendBeacon
-          ? navigator.sendBeacon(
-              `${syncConfig.proxyUrl}/api/sync`,
-              new Blob([body], { type: 'application/json' })
-            )
-          : fetch(`${syncConfig.proxyUrl}/api/sync`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-sync-secret': syncConfig.syncSecret },
-              body,
-              keepalive: true
-            });
+    const flush = (e) => {
+      if (syncStatus === 'pending') {
+        e.preventDefault();
+        e.returnValue = '';
       }
     };
     window.addEventListener('beforeunload', flush);
     return () => window.removeEventListener('beforeunload', flush);
-  }, [syncStatus, syncConfig, collectData]);
+  }, [syncStatus]);
 
   // Trigger push whenever any data changes
   React.useEffect(() => {
@@ -1783,7 +1853,7 @@ function App({
   // ── Real-time WebSocket sync — connection ─────────────────────────────────
 
   React.useEffect(() => {
-    if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
+    if (!syncConfig.proxyUrl || !loadAuthToken()) return;
 
     let cancelled = false;
     let reconnectTimer = null;
@@ -1795,7 +1865,7 @@ function App({
       try {
         const u = new URL(syncConfig.proxyUrl);
         u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-        u.search = '?secret=' + encodeURIComponent(syncConfig.syncSecret);
+        // auth now happens via a first WS message (see ws.onopen below), never via the URL
         wsUrl = u.toString();
       } catch {
         return;
@@ -1806,6 +1876,11 @@ function App({
 
       ws.onopen = () => {
         retryDelay = 2000; // reset backoff on success
+        // Authenticate over the socket itself — the session token never
+        // appears in the URL, so it can't end up in server/proxy access logs.
+        const token = loadAuthToken();
+        if (token) ws.send(JSON.stringify({ type: 'auth', token }));
+        else ws.close();
       };
 
       ws.onmessage = ev => {
@@ -1835,11 +1910,11 @@ function App({
       if (wsRef.current) wsRef.current.close();
       wsRef.current = null;
     };
-  }, [syncConfig.proxyUrl, syncConfig.syncSecret, applyRemoteData]);
+  }, [syncConfig.proxyUrl, applyRemoteData]);
 
   // Pull from cloud on first load
   React.useEffect(() => {
-    if (!syncConfig.proxyUrl || !syncConfig.syncSecret) return;
+    if (!syncConfig.proxyUrl || !loadAuthToken()) return;
     (async () => {
       setSyncStatus('syncing');
       const result = await cloudPull(syncConfig);
@@ -1944,22 +2019,23 @@ function App({
     Object.keys(localStorage).filter(k => k.startsWith(LS_KEY)).forEach(k => localStorage.removeItem(k));
     // Wipe cloud database
     const cfg = getSyncConfig();
-    if (cfg.proxyUrl && cfg.syncSecret) {
+    if (cfg.proxyUrl && loadAuthToken()) {
       try {
         await fetch(`${cfg.proxyUrl}/api/reset`, {
           method: 'POST',
-          headers: { 'x-sync-secret': cfg.syncSecret }
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ confirm: true })
         });
       } catch {}
     }
     window.location.reload();
   };
-  const showToast = (msg, type = 'green') => {
+  const showToast = (msg, type = 'green', duration = 3000) => {
     setToast({
       msg,
       type
     });
-    setTimeout(() => setToast(null), 3000);
+    setTimeout(() => setToast(null), duration);
   };
   const activeStudents = students.filter(s => !s.alumni);
   const totalFeesExpected = fees.reduce((a, f) => a + f.amount, 0);
@@ -2146,11 +2222,15 @@ function App({
     className: "app-shell"
   }, toast && /*#__PURE__*/React.createElement("div", {
     className: "toast",
+    onClick: () => { if (syncStatus === 'pending') manualPush(); },
     style: {
       background: toast.type === 'gold' ? 'var(--gold)' : toast.type === 'rose' ? 'var(--rose)' : 'var(--green)',
-      color: 'var(--navy)'
+      color: 'var(--navy)',
+      cursor: syncStatus === 'pending' ? 'pointer' : 'default'
     }
-  }, toast.msg), /*#__PURE__*/React.createElement("div", {
+  }, toast.msg, syncStatus === 'pending' && /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: '0.7rem', fontWeight: 700, marginTop: 4, textDecoration: 'underline' }
+  }, "☁️ Tap here to push to cloud now")), /*#__PURE__*/React.createElement("div", {
     className: `sidebar-overlay ${sidebarOpen ? '' : 'hidden'}`,
     onClick: () => setSidebarOpen(false)
   }), /*#__PURE__*/React.createElement("aside", {
@@ -2211,8 +2291,9 @@ function App({
     day: '2-digit',
     month: 'short',
     year: 'numeric'
-  })), syncConfig.proxyUrl && syncConfig.syncSecret && /*#__PURE__*/React.createElement("span", {
-    title: syncMsg || 'Cloud sync',
+  })), syncConfig.proxyUrl && /*#__PURE__*/React.createElement("span", {
+    title: !loadAuthToken() ? 'Not signed in to the cloud — tap to try pushing (will prompt you to sign back in if needed)' : syncStatus === 'pending' ? 'You have unsynced changes — tap to push to cloud now' : syncMsg || 'Cloud sync',
+    onClick: (syncStatus === 'pending' || !loadAuthToken()) ? manualPush : undefined,
     style: {
       fontSize: '0.68rem',
       display: 'flex',
@@ -2220,13 +2301,14 @@ function App({
       gap: 4,
       padding: '3px 8px',
       borderRadius: 20,
-      background: syncStatus === 'ok' ? 'rgba(34,197,94,0.12)' : syncStatus === 'error' ? 'rgba(239,68,68,0.12)' : syncStatus === 'syncing' ? 'rgba(234,179,8,0.12)' : 'rgba(255,255,255,0.05)',
-      color: syncStatus === 'ok' ? 'var(--green)' : syncStatus === 'error' ? 'var(--rose)' : syncStatus === 'syncing' || syncStatus === 'pending' ? 'var(--gold)' : 'var(--text2)',
-      fontWeight: 600,
-      cursor: 'default',
-      flexShrink: 0
+      background: !loadAuthToken() ? 'rgba(239,68,68,0.18)' : syncStatus === 'ok' ? 'rgba(34,197,94,0.12)' : syncStatus === 'error' ? 'rgba(239,68,68,0.12)' : syncStatus === 'pending' ? 'rgba(234,179,8,0.22)' : syncStatus === 'syncing' ? 'rgba(234,179,8,0.12)' : 'rgba(255,255,255,0.05)',
+      color: !loadAuthToken() ? 'var(--rose)' : syncStatus === 'ok' ? 'var(--green)' : syncStatus === 'error' ? 'var(--rose)' : syncStatus === 'syncing' || syncStatus === 'pending' ? 'var(--gold)' : 'var(--text2)',
+      fontWeight: syncStatus === 'pending' ? 800 : 600,
+      cursor: (syncStatus === 'pending' || !loadAuthToken()) ? 'pointer' : 'default',
+      flexShrink: 0,
+      border: syncStatus === 'pending' ? '1px solid var(--gold)' : 'none'
     }
-  }, syncStatus === 'syncing' || syncStatus === 'pending' ? '⏳' : syncStatus === 'ok' ? '☁️' : syncStatus === 'error' ? '⚠️' : '☁️', syncStatus === 'syncing' ? 'Syncing…' : syncStatus === 'pending' ? 'Saving…' : syncStatus === 'ok' ? 'Synced' : syncStatus === 'error' ? 'Sync error' : 'Cloud'), /*#__PURE__*/React.createElement("div", {
+  }, !loadAuthToken() ? '🚫' : syncStatus === 'syncing' ? '⏳' : syncStatus === 'pending' ? '⚠️' : syncStatus === 'ok' ? '☁️' : syncStatus === 'error' ? '⚠️' : '☁️', !loadAuthToken() ? 'Offline — not syncing' : syncStatus === 'syncing' ? 'Syncing…' : syncStatus === 'pending' ? 'Tap to Push' : syncStatus === 'ok' ? 'Synced' : syncStatus === 'error' ? 'Sync error' : 'Cloud'), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       alignItems: 'center',
@@ -6583,7 +6665,7 @@ function Students({
         ref: '',
         date: today()
       });
-      showToast('Payment recorded!');
+      showToast('Payment recorded!', 'green', 5000);
     };
     return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
       style: {
@@ -7172,14 +7254,26 @@ function Fees({
   const [showBulk, setShowBulk] = useState(false);
   const [bulkGrade, setBulkGrade] = useState('all');
   const [bulkAmount, setBulkAmount] = useState('8500');
+  const [editId, setEditId] = useState(null);
+  const startEdit = f => {
+    setEditId(f.id);
+    const student = students.find(s => s.id === f.studentId);
+    setForm({
+      studentId: f.studentId,
+      term: f.term,
+      amount: String(f.amount),
+      paid: String(f.paid),
+      method: f.method || 'M-Pesa',
+      ref: f.ref || '',
+      date: f.date || today()
+    });
+    setStudentSearch(student ? `${student.name} (${student.grade})` : '');
+    setShowForm(true);
+  };
 
-  // ── Auto-cleanup: remove fully-paid records & receipts from PAST terms ──
-  useEffect(() => {
-    const hasOldPaid = fees.some(f => f.status === 'paid' && f.term !== CURRENT_TERM);
-    if (hasOldPaid) {
-      setFees(p => p.filter(f => !(f.status === 'paid' && f.term !== CURRENT_TERM)));
-    }
-  }, []); // run once on mount
+  // NOTE: a previous auto-cleanup effect used to silently delete fully-paid fee records from
+  // past terms every time this page loaded. That destroyed historical payment/receipt data.
+  // Removed — paid records from past terms are kept for history/reporting.
 
   const bySearch = search.trim() ? fees.filter(f => {
     const s = students.find(st => st.id === f.studentId);
@@ -7187,42 +7281,81 @@ function Fees({
     return s?.name?.toLowerCase().includes(q) || s?.admNo?.toLowerCase?.().includes(q) || f.ref?.toLowerCase().includes(q);
   }) : fees;
   const filtered = filter === 'all' ? bySearch : bySearch.filter(f => f.status === filter);
+  const [saving, setSaving] = useState(false);
   const save = () => {
+    if (saving) return; // guard against a double-click recording the same payment twice
     if (!form.studentId || !form.paid) {
       showToast('Please fill required fields', 'rose');
       return;
     }
     const newPayment = parseFloat(form.paid);
     const amtNum    = parseFloat(form.amount);
-    if (isNaN(newPayment) || newPayment <= 0) { showToast('Enter a valid amount', 'rose'); return; }
+    if (isNaN(newPayment) || newPayment < 0 || (!editId && newPayment <= 0)) { showToast('Enter a valid amount', 'rose'); return; }
+    if (isNaN(amtNum) || amtNum <= 0) { showToast('Enter a valid fee amount', 'rose'); return; }
 
-    setFees(prev => {
-      const existing = prev.find(f => f.studentId === form.studentId && f.term === form.term);
-      if (existing) {
-        const totalPaid = (parseFloat(existing.paid) || 0) + newPayment;
-        const totalAmt  = parseFloat(existing.amount) || amtNum;
-        const status    = totalPaid >= totalAmt ? 'paid' : 'partial';
-        const history   = [...(existing.paymentHistory || [{ date: existing.date, amount: existing.paid, method: existing.method, ref: existing.ref }]),
-                           { date: form.date || today(), amount: newPayment, method: form.method, ref: form.ref || 'REF' + uid() }];
-        showToast(`✅ Payment added. Total paid: KES ${totalPaid.toLocaleString()}`);
-        return prev.map(f => f.id === existing.id
-          ? { ...f, paid: totalPaid, status, paymentHistory: history, lastPaymentDate: form.date || today() }
-          : f
-        );
-      } else {
-        const status = newPayment >= amtNum ? 'paid' : newPayment > 0 ? 'partial' : 'pending';
-        showToast('Payment recorded!');
-        return [...prev, {
-          id: 'F' + uid(),
-          ...form,
-          amount: amtNum,
-          paid: newPayment,
-          status,
-          ref: form.ref || 'REF' + uid(),
-          paymentHistory: [{ date: form.date || today(), amount: newPayment, method: form.method, ref: form.ref || 'REF' + uid() }]
-        }];
-      }
-    });
+    setSaving(true);
+
+    if (editId) {
+      // Direct correction of an existing record's billed amount / paid total —
+      // e.g. fixing a discount, scholarship, or a Bulk Set Fees default that
+      // doesn't apply to this particular student. Not an additive payment.
+      const status = newPayment >= amtNum ? 'paid' : newPayment > 0 ? 'partial' : 'pending';
+      setFees(prev => prev.map(f => f.id === editId ? {
+        ...f,
+        term: form.term,
+        amount: amtNum,
+        paid: newPayment,
+        status,
+        method: form.method,
+        ref: form.ref || f.ref,
+        date: form.date || f.date
+      } : f));
+      setShowForm(false);
+      setEditId(null);
+      setForm({
+        studentId: '',
+        term: CURRENT_TERM,
+        amount: '8500',
+        paid: '',
+        method: 'M-Pesa',
+        ref: '',
+        date: today()
+      });
+      setStudentSearch('');
+      setStudentDropOpen(false);
+      showToast('✅ Fee record updated');
+      setSaving(false);
+      return;
+    }
+
+    const existing = fees.find(f => f.studentId === form.studentId && f.term === form.term);
+    let successMsg;
+
+    if (existing) {
+      const totalPaid = (parseFloat(existing.paid) || 0) + newPayment;
+      const totalAmt  = parseFloat(existing.amount) || amtNum;
+      const status    = totalPaid >= totalAmt ? 'paid' : 'partial';
+      const history   = [...(existing.paymentHistory || [{ date: existing.date, amount: existing.paid, method: existing.method, ref: existing.ref }]),
+                         { date: form.date || today(), amount: newPayment, method: form.method, ref: form.ref || 'REF' + uid() }];
+      successMsg = `✅ Payment added. Total paid: KES ${totalPaid.toLocaleString()}`;
+      setFees(prev => prev.map(f => f.id === existing.id
+        ? { ...f, paid: totalPaid, status, paymentHistory: history, lastPaymentDate: form.date || today() }
+        : f
+      ));
+    } else {
+      const status = newPayment >= amtNum ? 'paid' : newPayment > 0 ? 'partial' : 'pending';
+      successMsg = '✅ Payment recorded!';
+      setFees(prev => [...prev, {
+        id: 'F' + uid(),
+        ...form,
+        amount: amtNum,
+        paid: newPayment,
+        status,
+        ref: form.ref || 'REF' + uid(),
+        paymentHistory: [{ date: form.date || today(), amount: newPayment, method: form.method, ref: form.ref || 'REF' + uid() }]
+      }]);
+    }
+
     setShowForm(false);
     setForm({
       studentId: '',
@@ -7235,7 +7368,8 @@ function Fees({
     });
     setStudentSearch('');
     setStudentDropOpen(false);
-    showToast('Payment recorded!');
+    showToast(successMsg, 'green', 5000);
+    setSaving(false);
   };
   const bulkSetFees = () => {
     const amtNum = parseFloat(bulkAmount);
@@ -7367,9 +7501,12 @@ function Fees({
     }
   }, /*#__PURE__*/React.createElement("div", {
     className: "section-header"
-  }, /*#__PURE__*/React.createElement("h2", null, "Record Payment"), /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("h2", null, editId ? "✏️ Edit Fee Record" : "Record Payment"), /*#__PURE__*/React.createElement("button", {
     className: "close-btn",
-    onClick: () => setShowForm(false)
+    onClick: () => {
+      setShowForm(false);
+      setEditId(null);
+    }
   }, "\xD7")), /*#__PURE__*/React.createElement("div", {
     className: "form-grid"
   }, /*#__PURE__*/React.createElement("div", {
@@ -7468,7 +7605,7 @@ function Fees({
     }))
   })), /*#__PURE__*/React.createElement("div", {
     className: "form-group"
-  }, /*#__PURE__*/React.createElement("label", null, "Amount Paid *"), /*#__PURE__*/React.createElement("input", {
+  }, /*#__PURE__*/React.createElement("label", null, editId ? "Total Paid So Far *" : "Amount Paid *"), /*#__PURE__*/React.createElement("input", {
     type: "number",
     value: form.paid,
     onChange: e => setForm(p => ({
@@ -7504,10 +7641,14 @@ function Fees({
     className: "flex gap-8 mt-16"
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
-    onClick: save
-  }, "Save Payment"), /*#__PURE__*/React.createElement("button", {
+    onClick: save,
+    disabled: saving
+  }, saving ? "Saving…" : editId ? "Save Changes" : "Save Payment"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-outline",
-    onClick: () => setShowForm(false)
+    onClick: () => {
+      setShowForm(false);
+      setEditId(null);
+    }
   }, "Cancel"))), /*#__PURE__*/React.createElement("div", {
     className: "card desktop-only"
   }, /*#__PURE__*/React.createElement("div", {
@@ -7548,13 +7689,15 @@ function Fees({
       className: "btn btn-teal btn-sm",
       onClick: () => setReceipt(f)
     }, "\uD83E\uDDFE View"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-sm",
+      title: "Edit",
+      onClick: () => startEdit(f)
+    }, "\u270F\uFE0F"), /*#__PURE__*/React.createElement("button", {
       className: "btn btn-rose btn-sm",
       title: "Delete",
       onClick: () => {
         if (confirm('Delete this payment record?')) {
-          const newFees = fees.filter(x => x.id !== f.id);
-          setFees(() => newFees);
-          schedulePush();
+          setFees(prev => prev.filter(x => x.id !== f.id));
           showToast('Payment deleted', 'rose');
         }
       }
@@ -10055,9 +10198,9 @@ async function sendATSms(phones, message, config) {
     try {
       const resp = await fetch(`${PROXY}/api/sms`, {
         method: 'POST',
-        headers: {
+        headers: authHeaders({
           'Content-Type': 'application/json'
-        },
+        }),
         body: JSON.stringify({
           apiKey: config.apiKey,
           username: config.username,
@@ -10111,9 +10254,9 @@ async function sendATWhatsApp(phones, message, config) {
     try {
       const resp = await fetch(`${PROXY}/api/whatsapp`, {
         method: 'POST',
-        headers: {
+        headers: authHeaders({
           'Content-Type': 'application/json'
-        },
+        }),
         body: JSON.stringify({
           apiKey: config.apiKey,
           username: config.username,
@@ -10232,9 +10375,9 @@ function Messaging({
     try {
       const res = await fetch('/api/ai-compose', {
         method: 'POST',
-        headers: {
+        headers: authHeaders({
           'Content-Type': 'application/json'
-        },
+        }),
         body: JSON.stringify({
           prompt: aiPrompt,
           term: CURRENT_TERM,
@@ -11162,7 +11305,7 @@ function Diagnostics({
     });
 
     // ── 7. Cloud sync config ──
-    const syncOk = syncConfig.proxyUrl && syncConfig.syncSecret;
+    const syncOk = syncConfig.proxyUrl && loadAuthToken();
     checks.push({
       id: 'sync_config',
       label: 'Cloud Sync Config',
@@ -11703,8 +11846,19 @@ function AccountManager({
   const [pinErr, setPinErr] = useState('');
   const [changingPin, setChangingPin] = useState(null); // userId for own PIN change
   const [newPin, setNewPin] = useState('');
+  const cfg = getSyncConfig();
+  // Accounts are managed server-side now (scrypt-hashed PINs) — never synced
+  // through the shared data channel. Load the real list on mount.
+  React.useEffect(() => {
+    if (session?.role !== 'admin' || !cfg.proxyUrl) return;
+    fetch(`${cfg.proxyUrl}/api/accounts`, { headers: authHeaders() })
+      .then(r => r.json())
+      .then(d => { if (d.ok) setAccounts(d.accounts.map(a => ({ ...a, id: a._id }))); })
+      .catch(() => {});
+    // eslint-disable-next-line
+  }, [session?.role]);
   const persist = updated => {
-    setAccounts(updated);
+    setAccounts(updated); // optimistic local update; server call happens in save()/toggleActive()/del() below
   };
   const openNew = () => {
     setForm({
@@ -11742,33 +11896,28 @@ function AccountManager({
       return;
     }
     setPinErr('');
-    if (editId) {
-      persist(accounts.map(a => a.id === editId ? {
-        ...a,
-        username: form.username.trim(),
-        name: form.name.trim(),
-        role: form.role,
-        ...(form.pin ? {
-          pinHash: hashPin(form.pin)
-        } : {})
-      } : a));
-      showToast('Account updated');
-    } else {
-      const exists = accounts.find(a => a.username.toLowerCase() === form.username.trim().toLowerCase());
-      if (exists) {
-        showToast('Username already taken', 'rose');
-        return;
+    const body = {
+      id: editId || undefined,
+      username: form.username.trim(),
+      name: form.name.trim(),
+      role: form.role,
+      active: true,
+      ...(form.pin ? { pin: form.pin } : {})
+    };
+    fetch(`${cfg.proxyUrl}/api/accounts`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body)
+    }).then(r => r.json()).then(d => {
+      if (!d.ok) { showToast(d.error || 'Save failed', 'rose'); return; }
+      if (editId) {
+        persist(accounts.map(a => a.id === editId ? { ...a, username: body.username, name: body.name, role: body.role } : a));
+        showToast('Account updated');
+      } else {
+        persist([...accounts, { id: d.id, username: body.username, name: body.name, role: body.role, active: true }]);
+        showToast('Account created — the new user must sign in with the PIN you set and will be asked to change it.');
       }
-      persist([...accounts, {
-        id: 'U' + uid(),
-        username: form.username.trim(),
-        name: form.name.trim(),
-        pinHash: hashPin(form.pin),
-        role: form.role,
-        active: true
-      }]);
-      showToast('Account created');
-    }
+    }).catch(() => showToast('Server unreachable', 'rose'));
     setShowForm(false);
   };
   const toggleActive = id => {
@@ -11776,10 +11925,16 @@ function AccountManager({
       showToast("Can't deactivate your own account", 'rose');
       return;
     }
-    persist(accounts.map(a => a.id === id ? {
-      ...a,
-      active: !a.active
-    } : a));
+    const acct = accounts.find(a => a.id === id);
+    if (!acct) return;
+    fetch(`${cfg.proxyUrl}/api/accounts`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ id, username: acct.username, name: acct.name, role: acct.role, active: !acct.active })
+    }).then(r => r.json()).then(d => {
+      if (!d.ok) { showToast(d.error || 'Update failed', 'rose'); return; }
+      persist(accounts.map(a => a.id === id ? { ...a, active: !a.active } : a));
+    }).catch(() => showToast('Server unreachable', 'rose'));
   };
   const del = id => {
     if (id === session.id) {
@@ -11787,21 +11942,31 @@ function AccountManager({
       return;
     }
     if (!confirm('Delete this account?')) return;
-    persist(accounts.filter(a => a.id !== id));
-    showToast('Account deleted', 'rose');
+    fetch(`${cfg.proxyUrl}/api/accounts/${id}`, {
+      method: 'DELETE',
+      headers: authHeaders()
+    }).then(r => r.json()).then(d => {
+      if (!d.ok) { showToast(d.error || 'Delete failed', 'rose'); return; }
+      persist(accounts.filter(a => a.id !== id));
+      showToast('Account deleted', 'rose');
+    }).catch(() => showToast('Server unreachable', 'rose'));
   };
   const saveOwnPin = () => {
     if (!newPin || newPin.length < 4 || !/^\d+$/.test(newPin)) {
       showToast('PIN must be 4–8 digits', 'rose');
       return;
     }
-    persist(accounts.map(a => a.id === session.id ? {
-      ...a,
-      pinHash: hashPin(newPin)
-    } : a));
-    setChangingPin(null);
-    setNewPin('');
-    showToast('PIN updated successfully ✅');
+    fetch(`${cfg.proxyUrl}/api/auth/change-pin`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ newPin })
+    }).then(r => r.json()).then(d => {
+      if (!d.ok) { showToast(d.error || 'Could not update PIN', 'rose'); return; }
+      cacheOfflineLogin(session.username, newPin, { id: session.id, username: session.username, name: session.name, role: session.role });
+      setChangingPin(null);
+      setNewPin('');
+      showToast('PIN updated successfully ✅');
+    }).catch(() => showToast('Server unreachable', 'rose'));
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "card"
@@ -12074,12 +12239,33 @@ function ATSettings({
   };
   useEffect(() => {
     recheckProxy();
+    // AT credentials now live server-side only (never synced/broadcast) —
+    // load the real stored config so this form reflects what the server
+    // (and its automated alert scheduler) actually has.
+    if (session?.role === 'admin' && syncConfig.proxyUrl && loadAuthToken()) {
+      fetch(`${syncConfig.proxyUrl}/api/at-config`, { headers: authHeaders() })
+        .then(r => r.json())
+        .then(d => { if (d.ok && d.config) { setForm(f => ({ ...f, ...d.config })); setAtConfig(d.config); } })
+        .catch(() => {});
+    }
+    // eslint-disable-next-line
   }, []);
   const save = () => {
     setAtConfig({
       ...form
     });
-    showToast('Credentials saved!');
+    if (session?.role === 'admin' && syncConfig.proxyUrl && loadAuthToken()) {
+      fetch(`${syncConfig.proxyUrl}/api/at-config`, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ config: form })
+      }).then(r => r.json()).then(d => {
+        if (d.ok) showToast('Credentials saved — the server can now send scheduled alert SMS too!');
+        else showToast(d.error || 'Saved locally, but the server rejected it', 'rose');
+      }).catch(() => showToast('Saved locally — server unreachable, so scheduled alert SMS will not use it yet', 'rose'));
+    } else {
+      showToast('Credentials saved locally!');
+    }
   };
   const testSms = async () => {
     const phone = normalizePhone(testPhone);
@@ -12369,11 +12555,11 @@ function ATSettings({
       /*#__PURE__*/React.createElement("button", {
         className: "btn btn-purple",
         onClick: async () => {
-          if (!syncConfig.proxyUrl || !syncConfig.syncSecret) { showToast('Configure cloud sync first', 'rose'); return; }
+          if (!syncConfig.proxyUrl || !loadAuthToken()) { showToast('Please sign in again', 'rose'); return; }
           try {
             const r = await fetch(`${syncConfig.proxyUrl}/api/push/test`, {
               method: 'POST',
-              headers: { 'x-sync-secret': syncConfig.syncSecret }
+              headers: authHeaders()
             });
             const d = await r.json();
             if (d.ok) showToast(`✅ Test notification sent to ${d.sent} device(s)!`);
@@ -12384,7 +12570,7 @@ function ATSettings({
       /*#__PURE__*/React.createElement("button", {
         className: "btn btn-outline",
         onClick: async () => {
-          if (!syncConfig.proxyUrl || !syncConfig.syncSecret) { showToast('Configure cloud sync first', 'rose'); return; }
+          if (!syncConfig.proxyUrl || !loadAuthToken()) { showToast('Please sign in again', 'rose'); return; }
           try {
             await registerPushSubscription(syncConfig);
             showToast('✅ This device subscribed to notifications!');
@@ -12790,7 +12976,7 @@ function ATSettings({
     style: {
       color: '#63b3ed'
     }
-  }, "How it works:"), " Every change auto-saves to cloud 3 seconds after you stop editing. When you open the app on another device, it loads the latest data from cloud automatically.")), /*#__PURE__*/React.createElement(AccountManager, {
+  }, "How it works:"), " Changes are marked as unsynced right away, but you must tap \u2B06\uFE0F Push to Cloud (top of the app) to actually save them to the server. Look for the gold \u201Cunsynced changes\u201D indicator in the header \u2014 tap it to push immediately. Other devices only see your changes after you push and they pull.")), /*#__PURE__*/React.createElement(AccountManager, {
     session: session,
     showToast: showToast,
     accounts: accounts,
