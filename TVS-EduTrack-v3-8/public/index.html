@@ -13083,7 +13083,76 @@ function ATSettings({
     onClick: clearAllData
   }, "\uD83D\uDDD1 Clear All Data (Irreversible)"))))));
 }
-ReactDOM.render(/*#__PURE__*/React.createElement(Root, null), document.getElementById('root'));
+
+// ──────────── ERROR BOUNDARY ────────────
+// Without this, ANY uncaught error anywhere in the tree unmounts the whole
+// app silently, leaving a totally blank page with no clue what happened.
+// This catches it, shows what actually broke, and offers a way to recover
+// without losing locally-saved data (a reload alone is usually enough,
+// since state lives in localStorage / will re-sync from the server).
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, info: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    this.setState({ info });
+    console.error('EduTrack crashed:', error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return /*#__PURE__*/React.createElement("div", {
+        style: {
+          maxWidth: 700,
+          margin: '60px auto',
+          padding: 24,
+          fontFamily: 'system-ui, sans-serif',
+          color: '#1a1a1a'
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: '2rem',
+          marginBottom: 8
+        }
+      }, "\u26A0\uFE0F"), /*#__PURE__*/React.createElement("h2", {
+        style: { marginBottom: 12 }
+      }, "Something went wrong"), /*#__PURE__*/React.createElement("p", {
+        style: { color: '#555', marginBottom: 16 }
+      }, "The page hit an error and couldn't continue. Your data is safe — nothing here is lost. Copy the details below and share them so this can be fixed."),
+      /*#__PURE__*/React.createElement("pre", {
+        style: {
+          background: '#f5f5f5',
+          border: '1px solid #ddd',
+          borderRadius: 8,
+          padding: 14,
+          fontSize: '0.78rem',
+          overflowX: 'auto',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+          marginBottom: 16
+        }
+      }, String(this.state.error && this.state.error.stack || this.state.error)),
+      /*#__PURE__*/React.createElement("button", {
+        onClick: () => window.location.reload(),
+        style: {
+          padding: '10px 20px',
+          background: '#1a1a2e',
+          color: '#fff',
+          border: 'none',
+          borderRadius: 8,
+          cursor: 'pointer',
+          fontSize: '0.9rem'
+        }
+      }, "\uD83D\uDD04 Reload App"));
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.render(/*#__PURE__*/React.createElement(ErrorBoundary, null, /*#__PURE__*/React.createElement(Root, null)), document.getElementById('root'));
 </script>
 
 <!-- ── PWA: Service Worker Registration ── -->
