@@ -2482,7 +2482,9 @@ function App({
     manualPull: manualPull,
     session: session,
     adminPhone: adminPhone,
-    setAdminPhone: setAdminPhone
+    setAdminPhone: setAdminPhone,
+    accounts: accounts,
+    setAccounts: setAccounts
   })), page === 'diagnostics' && (isTeacher ? /*#__PURE__*/React.createElement(AccessDenied, null) : /*#__PURE__*/React.createElement(Diagnostics, {
     students: students,
     fees: fees,
@@ -12217,7 +12219,9 @@ function ATSettings({
   manualPull,
   session,
   adminPhone,
-  setAdminPhone
+  setAdminPhone,
+  accounts,
+  setAccounts
 }) {
   const [form, setForm] = useState({
     ...atConfig
