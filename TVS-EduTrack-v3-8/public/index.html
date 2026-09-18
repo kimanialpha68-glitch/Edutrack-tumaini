@@ -696,6 +696,21 @@ function fmtDate(d) {
     year: 'numeric'
   });
 }
+// The Fees module's active term is set by an admin and then locked for a fixed
+// cycle — no one can change it again until the cycle has elapsed.
+const TERM_LOCK_MONTHS = 3;
+function termLockedUntil(setAtISO) {
+  if (!setAtISO) return null;
+  const d = new Date(setAtISO);
+  if (isNaN(d.getTime())) return null;
+  d.setMonth(d.getMonth() + TERM_LOCK_MONTHS);
+  return d;
+}
+function isTermLocked(feeTerm) {
+  if (!feeTerm || !feeTerm.term || !feeTerm.setAt) return false;
+  const until = termLockedUntil(feeTerm.setAt);
+  return !!until && new Date() < until;
+}
 const TRANSPORT_MODES = ['Walking', 'One-Way', 'Two-Way'];
 const FEEDING_PROGRAMS = ['None', 'Tea', 'Snack', 'Lunch', 'Tea + Lunch', 'Snack + Lunch'];
 const FEEDING_COLORS = {
@@ -1740,13 +1755,13 @@ function App({
   });
   const [adminPhone, setAdminPhone] = usePersist('adminPhone', '');
   const [feeDueDate, setFeeDueDate] = usePersist('feeDueDate', '');
-  // The active fee term for the Fees module — set once by an admin at the start of
-  // a term, then permanently locked. Synced like any other data so every device
-  // agrees on it. setFeeTerm refuses to overwrite a term that's already set, as a
-  // second line of defense alongside the UI hiding the control once locked.
+  // The active fee term for the Fees module — set by an admin, then locked for
+  // TERM_LOCK_MONTHS (3 months). Synced like any other data so every device agrees
+  // on it. setFeeTerm refuses to overwrite a term that's still within its lock
+  // window, as a second line of defense alongside the UI hiding the control.
   const [feeTerm, setFeeTermRaw] = usePersist('feeTerm', { term: null, setBy: null, setAt: null });
   const setFeeTerm = React.useCallback(term => {
-    setFeeTermRaw(prev => (prev && prev.term) ? prev : {
+    setFeeTermRaw(prev => isTermLocked(prev) ? prev : {
       term,
       setBy: session?.name || session?.username || 'Admin',
       setAt: new Date().toISOString()
@@ -7297,36 +7312,47 @@ function Promote({
 // ──────────── FEES ────────────
 const CURRENT_TERM = 'Term 2 2026';
 const TERM_OPTIONS = ['Term 2 2026', 'Term 3 2026', 'Term 1 2027', 'Term 2 2027', 'Term 3 2027', 'Term 1 2026'];
-// Shown at the top of the Fees module. Before a term is locked in, an admin picks
-// one from TERM_OPTIONS and confirms — after that, setFeeTerm refuses to change it,
-// so this always renders as a read-only badge from then on.
+// Shown at the top of the Fees module. An admin picks a term from TERM_OPTIONS and
+// confirms — after that, setFeeTerm refuses to change it until TERM_LOCK_MONTHS has
+// elapsed since it was set, so this renders as a read-only badge until the cycle ends.
 function TermLockBanner({ feeTerm, setFeeTerm, isAdmin }) {
-  const [draft, setDraft] = useState(TERM_OPTIONS[0]);
-  if (feeTerm?.term) {
+  const [draft, setDraft] = useState('');
+  const locked = isTermLocked(feeTerm);
+  if (feeTerm?.term && locked) {
+    const until = termLockedUntil(feeTerm.setAt);
     return /*#__PURE__*/React.createElement("div", {
       style: { background: 'rgba(240,165,0,0.08)', border: '1px solid rgba(240,165,0,0.3)', borderRadius: 9, padding: '10px 14px', marginBottom: 14, fontSize: '0.8rem' }
-    }, "\uD83D\uDD12 Active term: ", /*#__PURE__*/React.createElement("strong", null, feeTerm.term), " \u2014 locked in", feeTerm.setBy ? ` by ${feeTerm.setBy}` : '', feeTerm.setAt ? ` on ${fmtDate(feeTerm.setAt.slice(0, 10))}` : '', ". This cannot be changed.");
+    }, "\uD83D\uDD12 Active term: ", /*#__PURE__*/React.createElement("strong", null, feeTerm.term), " \u2014 locked in", feeTerm.setBy ? ` by ${feeTerm.setBy}` : '', feeTerm.setAt ? ` on ${fmtDate(feeTerm.setAt.slice(0, 10))}` : '', ". Cannot be changed until ", /*#__PURE__*/React.createElement("strong", null, until ? fmtDate(until.toISOString().slice(0, 10)) : '—'), ".");
   }
   if (!isAdmin) {
     return /*#__PURE__*/React.createElement("div", {
       style: { background: 'rgba(224,93,111,0.08)', border: '1px solid rgba(224,93,111,0.25)', borderRadius: 9, padding: '10px 14px', marginBottom: 14, fontSize: '0.8rem' }
-    }, "\u26A0\uFE0F The admin hasn't set this term's active term yet.");
+    }, feeTerm?.term ? `\u26A0\uFE0F The active term (${feeTerm.term}) has expired — waiting for the admin to set the next one.` : "\u26A0\uFE0F The admin hasn't set this term's active term yet.");
   }
   return /*#__PURE__*/React.createElement("div", {
     style: { background: 'rgba(224,93,111,0.08)', border: '1px solid rgba(224,93,111,0.25)', borderRadius: 9, padding: '12px 14px', marginBottom: 14 }
   }, /*#__PURE__*/React.createElement("div", {
     style: { fontWeight: 700, fontSize: '0.85rem', marginBottom: 6 }
-  }, "\u26A0\uFE0F Set the active term for Fees"), /*#__PURE__*/React.createElement("div", {
+  }, feeTerm?.term ? `\u26A0\uFE0F "${feeTerm.term}" has expired \u2014 set the next term` : "\u26A0\uFE0F Set the active term for Fees"), /*#__PURE__*/React.createElement("div", {
     style: { fontSize: '0.75rem', color: 'var(--text2)', marginBottom: 10 }
-  }, "Do this once, at the start of the term. It cannot be changed afterwards — double-check before confirming."), /*#__PURE__*/React.createElement("div", {
+  }, `Once set, this locks for ${TERM_LOCK_MONTHS} months and can't be changed until then — double-check before confirming.`), /*#__PURE__*/React.createElement("div", {
     style: { display: 'flex', gap: 8, flexWrap: 'wrap' }
-  }, /*#__PURE__*/React.createElement("select", {
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    list: "term-lock-suggestions",
+    placeholder: "e.g. Term 2 2026",
     value: draft,
-    onChange: e => setDraft(e.target.value)
-  }, TERM_OPTIONS.map(t => /*#__PURE__*/React.createElement("option", { key: t }, t))), /*#__PURE__*/React.createElement("button", {
+    onChange: e => setDraft(e.target.value),
+    style: { minWidth: 200 }
+  }), /*#__PURE__*/React.createElement("datalist", {
+    id: "term-lock-suggestions"
+  }, TERM_OPTIONS.map(t => /*#__PURE__*/React.createElement("option", { key: t, value: t }))), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
+    disabled: !draft.trim(),
     onClick: () => {
-      if (confirm(`Lock in "${draft}" as the active term for Fees?\n\nThis cannot be changed later.`)) setFeeTerm(draft);
+      const term = draft.trim();
+      if (!term) return;
+      if (confirm(`Lock in "${term}" as the active term for Fees?\n\nThis can't be changed for ${TERM_LOCK_MONTHS} months.`)) setFeeTerm(term);
     }
   }, "\uD83D\uDD12 Lock In This Term")));
 }
