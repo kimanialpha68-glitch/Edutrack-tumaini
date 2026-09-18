@@ -1124,7 +1124,15 @@ function loadLS(key, fallback) {
 function saveLS(key, val) {
   try {
     localStorage.setItem(LS_KEY + '_' + key, JSON.stringify(val));
-  } catch {}
+    return true;
+  } catch (e) {
+    // This used to fail completely silently — meaning data could look "saved" in the
+    // UI (React state updates regardless) while never actually reaching disk, only to
+    // vanish on the next page load/reopen with zero warning. Surface it instead.
+    console.error('❌ localStorage save FAILED for key:', key, e);
+    window.dispatchEvent(new CustomEvent('edutrack-storage-failed', { detail: { key, error: String(e && e.message || e) } }));
+    return false;
+  }
 }
 function usePersist(key, init) {
   const [val, setVal] = React.useState(() => loadLS(key, init));
@@ -1164,7 +1172,7 @@ function saveSyncConfig(cfg) {
 }
 
 // Keys that are saved/restored during cloud sync
-const SYNC_KEYS = ['students', 'fees', 'inventory', 'vehicles', 'routes', 'fueling', 'repairs', 'alumni', 'exams', 'messages'];
+const SYNC_KEYS = ['students', 'fees', 'inventory', 'vehicles', 'routes', 'fueling', 'repairs', 'alumni', 'exams', 'messages', 'feeTerm'];
 async function cloudPush(data, cfg) {
   if (!cfg.proxyUrl || !loadAuthToken()) return {
     ok: false,
@@ -1626,6 +1634,12 @@ function App({
   toggleTheme
 }) {
   const [page, setPage] = useState('dashboard');
+  const [storageError, setStorageError] = useState(null);
+  React.useEffect(() => {
+    const handler = e => setStorageError(e.detail);
+    window.addEventListener('edutrack-storage-failed', handler);
+    return () => window.removeEventListener('edutrack-storage-failed', handler);
+  }, []);
   const [students, setStudents] = usePersist('students', initStudents);
   const [fees, setFees] = usePersist('fees', initFees);
 
@@ -1726,6 +1740,18 @@ function App({
   });
   const [adminPhone, setAdminPhone] = usePersist('adminPhone', '');
   const [feeDueDate, setFeeDueDate] = usePersist('feeDueDate', '');
+  // The active fee term for the Fees module — set once by an admin at the start of
+  // a term, then permanently locked. Synced like any other data so every device
+  // agrees on it. setFeeTerm refuses to overwrite a term that's already set, as a
+  // second line of defense alongside the UI hiding the control once locked.
+  const [feeTerm, setFeeTermRaw] = usePersist('feeTerm', { term: null, setBy: null, setAt: null });
+  const setFeeTerm = React.useCallback(term => {
+    setFeeTermRaw(prev => (prev && prev.term) ? prev : {
+      term,
+      setBy: session?.name || session?.username || 'Admin',
+      setAt: new Date().toISOString()
+    });
+  }, [session]);
   // Accounts are managed server-side via /api/accounts (scrypt-hashed PINs) and are
   // no longer part of collectData()/sync — this local copy is just a display cache
   // for the AccountManager UI, refreshed from the server on mount.
@@ -1767,8 +1793,9 @@ function App({
     repairs,
     alumni,
     exams,
-    messages
-  }), [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages]);
+    messages,
+    feeTerm
+  }), [students, fees, inventory, vehicles, routes, fueling, repairs, alumni, exams, messages, feeTerm]);
 
   // ── Real-time WebSocket sync — refs & helpers ─────────────────────────────
   const suppressNextPushRef = React.useRef(false);
@@ -1790,12 +1817,15 @@ function App({
     if (d.alumni)    setAlumni(d.alumni);
     if (d.exams)     setExams(d.exams);
     if (d.messages)  setMessages(d.messages);
+    // Only ever adopt a remote feeTerm if it's actually set — never let a stale/empty
+    // remote value unlock a term this device already has locked in.
+    if (d.feeTerm && d.feeTerm.term) setFeeTermRaw(d.feeTerm);
     const ts = new Date().toLocaleString();
     setLastSync(ts);
     localStorage.setItem('edutrack_last_sync', ts);
     setSyncStatus('ok');
     setSyncMsg(`Live update received ${new Date().toLocaleTimeString()}`);
-  }, [setStudents, setFees, setInventory, setVehicles, setRoutes, setFueling, setRepairs, setAlumni, setExams, setMessages, setAccounts]);
+  }, [setStudents, setFees, setInventory, setVehicles, setRoutes, setFueling, setRepairs, setAlumni, setExams, setMessages, setAccounts, setFeeTermRaw]);
 
   // Manual-only sync: local changes are marked as "unsynced" but never pushed automatically.
   // The only way data reaches the server is the explicit "Push to Cloud" button (manualPush).
@@ -2220,7 +2250,39 @@ function App({
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "app-shell"
-  }, toast && /*#__PURE__*/React.createElement("div", {
+  }, storageError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'sticky',
+      top: 0,
+      zIndex: 9999,
+      background: '#c0392b',
+      color: '#fff',
+      padding: '12px 16px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      flexWrap: 'wrap',
+      gap: 10,
+      fontSize: '0.85rem'
+    }
+  }, /*#__PURE__*/React.createElement("div", null,
+    /*#__PURE__*/React.createElement("strong", null, "⚠️ Your device's storage is full — the last change may NOT have saved."),
+    " Export a backup now before doing anything else, then free up space (clear browser data for other sites, or use a different device)."
+  ), /*#__PURE__*/React.createElement("div", {
+    style: { display: 'flex', gap: 8 }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: exportData,
+    style: {
+      background: '#fff', color: '#c0392b', border: 'none', borderRadius: 6,
+      padding: '6px 12px', fontWeight: 700, cursor: 'pointer'
+    }
+  }, "📥 Export Backup Now"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setStorageError(null),
+    style: {
+      background: 'transparent', color: '#fff', border: '1px solid #fff', borderRadius: 6,
+      padding: '6px 12px', cursor: 'pointer'
+    }
+  }, "Dismiss"))), toast && /*#__PURE__*/React.createElement("div", {
     className: "toast",
     onClick: () => { if (syncStatus === 'pending') manualPush(); },
     style: {
@@ -2420,7 +2482,10 @@ function App({
     setFees: setFees,
     showToast: showToast,
     setReceipt: setReceipt,
-    immediatePush: immediatePush
+    immediatePush: immediatePush,
+    session: session,
+    feeTerm: feeTerm,
+    setFeeTerm: setFeeTerm
   })), page === 'receipts' && (isTeacher ? /*#__PURE__*/React.createElement(AccessDenied, null) : /*#__PURE__*/React.createElement(Receipts, {
     fees: fees,
     students: activeStudents,
@@ -7232,17 +7297,55 @@ function Promote({
 // ──────────── FEES ────────────
 const CURRENT_TERM = 'Term 2 2026';
 const TERM_OPTIONS = ['Term 2 2026', 'Term 3 2026', 'Term 1 2027', 'Term 2 2027', 'Term 3 2027', 'Term 1 2026'];
+// Shown at the top of the Fees module. Before a term is locked in, an admin picks
+// one from TERM_OPTIONS and confirms — after that, setFeeTerm refuses to change it,
+// so this always renders as a read-only badge from then on.
+function TermLockBanner({ feeTerm, setFeeTerm, isAdmin }) {
+  const [draft, setDraft] = useState(TERM_OPTIONS[0]);
+  if (feeTerm?.term) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: { background: 'rgba(240,165,0,0.08)', border: '1px solid rgba(240,165,0,0.3)', borderRadius: 9, padding: '10px 14px', marginBottom: 14, fontSize: '0.8rem' }
+    }, "\uD83D\uDD12 Active term: ", /*#__PURE__*/React.createElement("strong", null, feeTerm.term), " \u2014 locked in", feeTerm.setBy ? ` by ${feeTerm.setBy}` : '', feeTerm.setAt ? ` on ${fmtDate(feeTerm.setAt.slice(0, 10))}` : '', ". This cannot be changed.");
+  }
+  if (!isAdmin) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: { background: 'rgba(224,93,111,0.08)', border: '1px solid rgba(224,93,111,0.25)', borderRadius: 9, padding: '10px 14px', marginBottom: 14, fontSize: '0.8rem' }
+    }, "\u26A0\uFE0F The admin hasn't set this term's active term yet.");
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    style: { background: 'rgba(224,93,111,0.08)', border: '1px solid rgba(224,93,111,0.25)', borderRadius: 9, padding: '12px 14px', marginBottom: 14 }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, fontSize: '0.85rem', marginBottom: 6 }
+  }, "\u26A0\uFE0F Set the active term for Fees"), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: '0.75rem', color: 'var(--text2)', marginBottom: 10 }
+  }, "Do this once, at the start of the term. It cannot be changed afterwards — double-check before confirming."), /*#__PURE__*/React.createElement("div", {
+    style: { display: 'flex', gap: 8, flexWrap: 'wrap' }
+  }, /*#__PURE__*/React.createElement("select", {
+    value: draft,
+    onChange: e => setDraft(e.target.value)
+  }, TERM_OPTIONS.map(t => /*#__PURE__*/React.createElement("option", { key: t }, t))), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-gold",
+    onClick: () => {
+      if (confirm(`Lock in "${draft}" as the active term for Fees?\n\nThis cannot be changed later.`)) setFeeTerm(draft);
+    }
+  }, "\uD83D\uDD12 Lock In This Term")));
+}
 function Fees({
   students,
   fees,
   setFees,
   showToast,
-  setReceipt
+  setReceipt,
+  session,
+  feeTerm,
+  setFeeTerm
 }) {
+  const activeTerm = feeTerm?.term || null;
+  const isAdmin = session?.role === 'admin';
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({
     studentId: '',
-    term: CURRENT_TERM,
+    term: activeTerm || TERM_OPTIONS[0],
     amount: '8500',
     paid: '',
     method: 'M-Pesa',
@@ -7271,6 +7374,32 @@ function Fees({
     });
     setStudentSearch(student ? `${student.name} (${student.grade})` : '');
     setShowForm(true);
+  };
+
+  const deleteInstalment = (feeId, index) => {
+    const f = fees.find(x => x.id === feeId);
+    if (!f || !f.paymentHistory) return;
+    const removed = f.paymentHistory[index];
+    if (!confirm(`Delete this payment of KES ${parseFloat(removed.amount).toLocaleString()}${removed.date ? ' on ' + fmtDate(removed.date) : ''}? This cannot be undone.`)) return;
+
+    const newHistory = f.paymentHistory.filter((_, i) => i !== index);
+    const newPaid = newHistory.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+    const newStatus = newPaid >= f.amount ? 'paid' : newPaid > 0 ? 'partial' : 'pending';
+    const lastEntry = newHistory[newHistory.length - 1];
+
+    setFees(prev => prev.map(x => x.id === feeId ? {
+      ...x,
+      paid: newPaid,
+      status: newStatus,
+      paymentHistory: newHistory,
+      // Keep the record's own summary fields (method/ref/date) in sync with whatever
+      // payment is now the most recent, so the main row and receipt stay accurate.
+      method: lastEntry ? lastEntry.method : x.method,
+      ref: lastEntry ? lastEntry.ref : x.ref,
+      date: lastEntry ? lastEntry.date : x.date,
+      lastPaymentDate: lastEntry ? lastEntry.date : x.lastPaymentDate
+    } : x));
+    showToast('Payment removed, balance updated');
   };
 
   // NOTE: a previous auto-cleanup effect used to silently delete fully-paid fee records from
@@ -7316,7 +7445,7 @@ function Fees({
       setEditId(null);
       setForm({
         studentId: '',
-        term: CURRENT_TERM,
+        term: activeTerm || TERM_OPTIONS[0],
         amount: '8500',
         paid: '',
         method: 'M-Pesa',
@@ -7361,7 +7490,7 @@ function Fees({
     setShowForm(false);
     setForm({
       studentId: '',
-      term: CURRENT_TERM,
+      term: activeTerm || TERM_OPTIONS[0],
       amount: '8500',
       paid: '',
       method: 'M-Pesa',
@@ -7374,16 +7503,17 @@ function Fees({
     setSaving(false);
   };
   const bulkSetFees = () => {
+    if (!activeTerm) { showToast('Lock in this term above before bulk-setting fees', 'rose'); return; }
     const amtNum = parseFloat(bulkAmount);
     if (isNaN(amtNum) || amtNum <= 0) { showToast('Enter a valid amount', 'rose'); return; }
     const target = bulkGrade === 'all' ? students : students.filter(s => s.grade === bulkGrade);
-    const alreadyHas = new Set(fees.filter(f => f.term === CURRENT_TERM).map(f => f.studentId));
+    const alreadyHas = new Set(fees.filter(f => f.term === activeTerm).map(f => f.studentId));
     const toCreate = target.filter(s => !alreadyHas.has(s.id));
     if (toCreate.length === 0) { showToast('Every student in that selection already has a fee record for this term', 'gold'); return; }
     setFees(prev => [...prev, ...toCreate.map(s => ({
       id: 'F' + uid(),
       studentId: s.id,
-      term: CURRENT_TERM,
+      term: activeTerm,
       amount: amtNum,
       paid: 0,
       status: 'pending',
@@ -7395,9 +7525,13 @@ function Fees({
     showToast(`✅ Fee of KES ${amtNum.toLocaleString()} set for ${toCreate.length} student(s). ${target.length - toCreate.length} already had a record.`);
     setShowBulk(false);
   };
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(TermLockBanner, {
+    feeTerm: feeTerm,
+    setFeeTerm: setFeeTerm,
+    isAdmin: isAdmin
+  }), /*#__PURE__*/React.createElement("div", {
     className: "section-header"
-  }, /*#__PURE__*/React.createElement("h2", null, "Fees Management \u2014 ", CURRENT_TERM), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("h2", null, "Fees Management \u2014 ", activeTerm || 'Term not set'), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-8"
   }, /*#__PURE__*/React.createElement("input", {
     type: "text",
@@ -7472,7 +7606,7 @@ function Fees({
       color: 'var(--text2)',
       marginBottom: 12
     }
-  }, "Creates a ", CURRENT_TERM, " fee record (balance = full amount, KES 0 paid) for every student in the selection who doesn't already have one. Existing records are never overwritten."), /*#__PURE__*/React.createElement("div", {
+  }, "Creates a ", activeTerm || 'current-term', " fee record (balance = full amount, KES 0 paid) for every student in the selection who doesn't already have one. Existing records are never overwritten."), /*#__PURE__*/React.createElement("div", {
     className: "form-grid"
   }, /*#__PURE__*/React.createElement("div", {
     className: "form-group"
@@ -7707,8 +7841,20 @@ function Fees({
     f.paymentHistory && f.paymentHistory.length > 1 && /*#__PURE__*/React.createElement("tr", { style: { background: 'rgba(0,0,0,0.2)' } },
       /*#__PURE__*/React.createElement("td", { colSpan: 9, style: { padding: '6px 12px' } },
         /*#__PURE__*/React.createElement("div", { style: { fontSize: '0.7rem', color: 'var(--gold)', fontWeight: 700, marginBottom: 4 } }, `📋 ${f.paymentHistory.length} instalments:`),
-        f.paymentHistory.map((p, i) => /*#__PURE__*/React.createElement("span", { key: i, style: { marginRight: 16, color: 'var(--text2)', fontSize: '0.7rem' } },
-          `${i+1}. KES ${parseFloat(p.amount).toLocaleString()} via ${p.method || '—'}${p.date ? ' on ' + fmtDate(p.date) : ''}${p.ref ? ' ('+p.ref+')' : ''}`
+        f.paymentHistory.map((p, i) => /*#__PURE__*/React.createElement("span", { key: i, style: { marginRight: 16, color: 'var(--text2)', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: 4 } },
+          `${i+1}. KES ${parseFloat(p.amount).toLocaleString()} via ${p.method || '—'}${p.date ? ' on ' + fmtDate(p.date) : ''}${p.ref ? ' ('+p.ref+')' : ''}`,
+          /*#__PURE__*/React.createElement("button", {
+            title: "Delete this payment",
+            onClick: () => deleteInstalment(f.id, i),
+            style: {
+              background: 'none',
+              border: 'none',
+              color: 'var(--rose)',
+              cursor: 'pointer',
+              fontSize: '0.75rem',
+              padding: '0 2px'
+            }
+          }, "\u2715")
         ))
       )
     )
@@ -7762,9 +7908,7 @@ function Fees({
       className: "btn btn-rose btn-sm",
       onClick: () => {
         if (confirm('Delete this payment record?')) {
-          const nf = fees.filter(x => x.id !== f.id);
-          setFees(() => nf);
-          schedulePush();
+          setFees(prev => prev.filter(x => x.id !== f.id));
           showToast('Payment deleted', 'rose');
         }
       }
@@ -10329,6 +10473,9 @@ function Messaging({
   const [sendLog, setSendLog] = useState([]);
   const [progress, setProgress] = useState(0);
   const [sendDone, setSendDone] = useState(false);
+  const [showAllRecipients, setShowAllRecipients] = useState(false);
+  const [showAllNoPhone, setShowAllNoPhone] = useState(false);
+  const [showAllNoFeeRecord, setShowAllNoFeeRecord] = useState(false);
   const configured = atConfig.apiKey || atConfig.sandbox;
   const getRecipients = () => {
     if (form.recipients === 'all') return students;
@@ -10880,10 +11027,10 @@ function Messaging({
     }
   }, "\uD83E\uDDEA Sandbox \u2014 no real messages sent")), /*#__PURE__*/React.createElement("div", {
     style: {
-      maxHeight: 180,
+      maxHeight: showAllRecipients ? 360 : 180,
       overflowY: 'auto'
     }
-  }, recipients.slice(0, 6).map(s => /*#__PURE__*/React.createElement("div", {
+  }, recipients.slice(0, showAllRecipients ? recipients.length : 6).map(s => /*#__PURE__*/React.createElement("div", {
     key: s.id,
     style: {
       display: 'flex',
@@ -10922,9 +11069,12 @@ function Messaging({
     className: "fc-text2 fs-sm",
     style: {
       paddingTop: 6,
-      textAlign: 'center'
-    }
-  }, "+", recipients.length - 6, " more"))), (sending || sendDone) && /*#__PURE__*/React.createElement("div", {
+      textAlign: 'center',
+      cursor: 'pointer',
+      textDecoration: 'underline'
+    },
+    onClick: () => setShowAllRecipients(v => !v)
+  }, showAllRecipients ? "Show less" : `+${recipients.length - 6} more \u2014 show all`))), (sending || sendDone) && /*#__PURE__*/React.createElement("div", {
     className: "card"
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -11007,7 +11157,17 @@ function Messaging({
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: { fontWeight: 600, marginBottom: 4 }
-  }, "\u26A0\uFE0F Before you send:"), sendIssues.noPhone.length > 0 && /*#__PURE__*/React.createElement("div", null, "\u2022 ", sendIssues.noPhone.length, " of ", recipients.length, " recipient(s) have no valid phone number and will be skipped: ", sendIssues.noPhone.slice(0, 5).map(s => s.name).join(', '), sendIssues.noPhone.length > 5 ? ` +${sendIssues.noPhone.length - 5} more` : ''), sendIssues.noFeeRecord.length > 0 && /*#__PURE__*/React.createElement("div", null, "\u2022 ", sendIssues.noFeeRecord.length, " recipient(s) have no fee record on file \u2014 their {balance} will show as KES 0: ", sendIssues.noFeeRecord.slice(0, 5).map(s => s.name).join(', '), sendIssues.noFeeRecord.length > 5 ? ` +${sendIssues.noFeeRecord.length - 5} more` : ''), sendIssues.missingDueDate && /*#__PURE__*/React.createElement("div", null, "\u2022 Message uses {due_date} but no Fee Due Date is set above \u2014 parents will see a placeholder warning instead of a date.")), /*#__PURE__*/React.createElement("button", {
+  }, "\u26A0\uFE0F Before you send:"), sendIssues.noPhone.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: { marginBottom: 4 }
+  }, "\u2022 ", sendIssues.noPhone.length, " of ", recipients.length, " recipient(s) have no valid phone number and will be skipped: ", (showAllNoPhone ? sendIssues.noPhone : sendIssues.noPhone.slice(0, 5)).map(s => s.name).join(', '), sendIssues.noPhone.length > 5 && /*#__PURE__*/React.createElement("span", {
+    onClick: () => setShowAllNoPhone(v => !v),
+    style: { cursor: 'pointer', textDecoration: 'underline', marginLeft: 4, whiteSpace: 'nowrap' }
+  }, showAllNoPhone ? ' (show less)' : ` +${sendIssues.noPhone.length - 5} more \u2014 show all`)), sendIssues.noFeeRecord.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: { marginBottom: 4 }
+  }, "\u2022 ", sendIssues.noFeeRecord.length, " recipient(s) have no fee record on file \u2014 their {balance} will show as KES 0: ", (showAllNoFeeRecord ? sendIssues.noFeeRecord : sendIssues.noFeeRecord.slice(0, 5)).map(s => s.name).join(', '), sendIssues.noFeeRecord.length > 5 && /*#__PURE__*/React.createElement("span", {
+    onClick: () => setShowAllNoFeeRecord(v => !v),
+    style: { cursor: 'pointer', textDecoration: 'underline', marginLeft: 4, whiteSpace: 'nowrap' }
+  }, showAllNoFeeRecord ? ' (show less)' : ` +${sendIssues.noFeeRecord.length - 5} more \u2014 show all`)), sendIssues.missingDueDate && /*#__PURE__*/React.createElement("div", null, "\u2022 Message uses {due_date} but no Fee Due Date is set above \u2014 parents will see a placeholder warning instead of a date.")), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
     style: {
       width: '100%',
@@ -11687,15 +11847,23 @@ function orphanData(exams, students, fees) {
 }
 
 // ──────────── MESSAGE LOG ────────────
+// A recipient counts as "delivered" using the same rule the sender already applies when it
+// computes msgRecord.successCount: smsStatus or waStatus === 'Success'. Anything else
+// (a bad number, blacklisted, proxy unreachable, etc.) is undelivered.
+function undeliveredRecipients(m) {
+  return (m.log || []).filter(l => !(l.smsStatus === 'Success' || l.waStatus === 'Success'));
+}
 function MessageLog({
   messages,
   students
 }) {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
+  const [undeliveredOnly, setUndeliveredOnly] = useState(false);
+  const [expandedId, setExpandedId] = useState(null);
   const filtered = messages.filter(m => {
     const q = search.toLowerCase();
-    return (!q || m.subject.toLowerCase().includes(q) || m.body.toLowerCase().includes(q)) && (!typeFilter || m.type === typeFilter);
+    return (!q || m.subject.toLowerCase().includes(q) || m.body.toLowerCase().includes(q)) && (!typeFilter || m.type === typeFilter) && (!undeliveredOnly || undeliveredRecipients(m).length > 0);
   });
   const types = [...new Set(messages.map(m => m.type))];
   const typeColor = {
@@ -11734,7 +11902,21 @@ function MessageLog({
   }, "All Types"), types.map(t => /*#__PURE__*/React.createElement("option", {
     key: t,
     value: t
-  }, typeIcon[t] || '📨', " ", t.charAt(0).toUpperCase() + t.slice(1)))))), filtered.length === 0 && /*#__PURE__*/React.createElement("div", {
+  }, typeIcon[t] || '📨', " ", t.charAt(0).toUpperCase() + t.slice(1)))), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      fontSize: '0.78rem',
+      color: 'var(--text2)',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap'
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: undeliveredOnly,
+    onChange: e => setUndeliveredOnly(e.target.checked)
+  }), "\u26A0\uFE0F Undelivered only"))), filtered.length === 0 && /*#__PURE__*/React.createElement("div", {
     className: "empty"
   }, /*#__PURE__*/React.createElement("div", {
     className: "empty-icon"
@@ -11789,7 +11971,23 @@ function MessageLog({
       fontSize: '0.7rem',
       color: 'var(--text2)'
     }
-  }, "\uD83D\uDC65 ", m.recipientCount || 0, " recipients"), m.sentBy && /*#__PURE__*/React.createElement("span", {
+  }, "\uD83D\uDC65 ", m.recipientCount || 0, " recipients"), m.log && (() => {
+    const bad = undeliveredRecipients(m);
+    const ok = (m.recipientCount || 0) - bad.length;
+    return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: '0.7rem',
+        color: 'var(--green)'
+      }
+    }, "\u2705 ", ok, " delivered"), bad.length > 0 && /*#__PURE__*/React.createElement("span", {
+      className: "badge badge-rose",
+      style: {
+        fontSize: '0.68rem',
+        cursor: 'pointer'
+      },
+      onClick: () => setExpandedId(expandedId === m.id ? null : m.id)
+    }, "\u26A0\uFE0F ", bad.length, " undelivered ", expandedId === m.id ? '\u25B2' : '\u25BC'));
+  })(), m.sentBy && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: '0.7rem',
       color: 'var(--text2)'
@@ -11809,7 +12007,34 @@ function MessageLog({
       padding: '10px 12px',
       lineHeight: 1.6
     }
-  }, m.body)))));
+  }, m.body), expandedId === m.id && undeliveredRecipients(m).length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8,
+      background: 'rgba(224,93,111,0.08)',
+      border: '1px solid rgba(224,93,111,0.25)',
+      borderRadius: 7,
+      padding: '8px 10px',
+      fontSize: '0.72rem'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 6,
+      color: 'var(--rose)'
+    }
+  }, "Undelivered:"), undeliveredRecipients(m).map((r, idx) => /*#__PURE__*/React.createElement("div", {
+    key: idx,
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 8,
+      padding: '3px 0'
+    }
+  }, /*#__PURE__*/React.createElement("span", null, r.name || '—', " (", r.phone || '—', ")"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: 'var(--text2)'
+    }
+  }, r.smsStatus && r.smsStatus !== '—' ? r.smsStatus : r.waStatus))))))));
 }
 
 // ──────────── ACCESS DENIED / ACCOUNTS / SETTINGS ────────────
