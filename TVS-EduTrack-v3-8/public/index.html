@@ -125,6 +125,7 @@
   }
   .logo {
     padding:18px 16px; border-bottom:1px solid var(--border);
+    padding-top:calc(18px + env(safe-area-inset-top, 0px));
     display:flex; align-items:center; gap:10px; min-height:var(--topbar-h);
   }
   .logo-icon { font-size:1.5rem; flex-shrink:0; }
@@ -180,6 +181,9 @@
   .topbar {
     background:var(--navy2); border-bottom:1px solid var(--border);
     padding:0 20px; height:var(--topbar-h);
+    padding-top:env(safe-area-inset-top, 0px);
+    height:calc(var(--topbar-h) + env(safe-area-inset-top, 0px));
+    box-sizing:border-box;
     display:flex; align-items:center; justify-content:space-between;
     position:sticky; top:0; z-index:100;
   }
@@ -710,6 +714,12 @@ function isTermLocked(feeTerm) {
   if (!feeTerm || !feeTerm.term || !feeTerm.setAt) return false;
   const until = termLockedUntil(feeTerm.setAt);
   return !!until && new Date() < until;
+}
+// A student's true balance is the sum across every fee record they have (one per
+// term) — not just whichever record happens to be first in the array. Used
+// wherever a "how much does this student owe overall" figure is needed.
+function studentFeeBalance(fees, studentId) {
+  return fees.filter(f => f.studentId === studentId).reduce((a, f) => a + (f.amount - f.paid), 0);
 }
 const TRANSPORT_MODES = ['Walking', 'One-Way', 'Two-Way'];
 const FEEDING_PROGRAMS = ['None', 'Tea', 'Snack', 'Lunch', 'Tea + Lunch', 'Snack + Lunch'];
@@ -2018,7 +2028,8 @@ function App({
       alumni,
       exams,
       messages,
-      atConfig
+      atConfig,
+      feeTerm
     };
     const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
       type: 'application/json'
@@ -2049,6 +2060,7 @@ function App({
         if (d.exams) setExams(d.exams);
         if (d.messages) setMessages(d.messages);
         if (d.atConfig) setAtConfig(d.atConfig);
+        if (d.feeTerm && d.feeTerm.term) setFeeTermRaw(d.feeTerm);
         showToast('✅ Data restored successfully!');
       } catch {
         showToast('❌ Invalid backup file', 'rose');
@@ -2476,7 +2488,8 @@ function App({
     setFees: setFees,
     setReceipt: setReceipt,
     session: session,
-    immediatePush: immediatePush
+    immediatePush: immediatePush,
+    feeTerm: feeTerm
   }), page === 'exams' && /*#__PURE__*/React.createElement(ExamsPage, {
     students: activeStudents,
     exams: exams,
@@ -2976,8 +2989,27 @@ const BLANK_STUDENT = {
   enrolled: today(),
   transportMode: 'Walking',
   route: '',
-  feeding: 'None'
+  feeding: 'None',
+  hasHealthCondition: false,
+  healthCondition: '',
+  siblingIds: []
 };
+// Keeps sibling links symmetric: when a student's sibling list changes, add/remove
+// that student's own id on the other side of each link too.
+function syncSiblingLinks(list, studentId, oldIds, newIds) {
+  const added = newIds.filter(id => !oldIds.includes(id));
+  const removed = oldIds.filter(id => !newIds.includes(id));
+  if (!added.length && !removed.length) return list;
+  return list.map(s => {
+    if (added.includes(s.id)) {
+      return { ...s, siblingIds: Array.from(new Set([...(s.siblingIds || []), studentId])) };
+    }
+    if (removed.includes(s.id)) {
+      return { ...s, siblingIds: (s.siblingIds || []).filter(id => id !== studentId) };
+    }
+    return s;
+  });
+}
 
 // ──────────── EXAMS PAGE ────────────
 function ExamsPage({
@@ -4590,17 +4622,26 @@ function StudentForm({
   onSave,
   onCancel,
   title,
-  routes = []
+  routes = [],
+  students = [],
+  currentId = null
 }) {
   const [form, setForm] = useState({
     ...BLANK_STUDENT,
     ...initial
   });
+  const [siblingSearch, setSiblingSearch] = useState('');
   const isTransport = form.transportMode === 'One-Way' || form.transportMode === 'Two-Way';
   const set = (k, v) => setForm(p => ({
     ...p,
     [k]: v
   }));
+  const siblingIds = form.siblingIds || [];
+  const siblingMatches = siblingSearch.trim() ? students.filter(s =>
+    s.id !== currentId &&
+    !siblingIds.includes(s.id) &&
+    s.name.toLowerCase().includes(siblingSearch.trim().toLowerCase())
+  ).slice(0, 6) : [];
   return /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
@@ -4694,6 +4735,62 @@ function StudentForm({
       fontWeight: 600,
       marginBottom: 10
     }
+  }, "\uD83D\uDC6B Siblings"), /*#__PURE__*/React.createElement("div", {
+    style: { marginBottom: 18, position: 'relative' }
+  }, siblingIds.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }
+  }, siblingIds.map(id => {
+    const sib = students.find(s => s.id === id);
+    return /*#__PURE__*/React.createElement("span", {
+      key: id,
+      className: "badge badge-teal",
+      style: { display: 'flex', alignItems: 'center', gap: 6 }
+    }, sib ? `${sib.name} (${sib.grade})` : id, /*#__PURE__*/React.createElement("span", {
+      onClick: () => set('siblingIds', siblingIds.filter(x => x !== id)),
+      style: { cursor: 'pointer', fontWeight: 700 }
+    }, "\xD7"));
+  })), /*#__PURE__*/React.createElement("input", {
+    value: siblingSearch,
+    onChange: e => setSiblingSearch(e.target.value),
+    placeholder: "\uD83D\uDD0D Search a student to link as a sibling..."
+  }), siblingMatches.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: 'absolute',
+      zIndex: 20,
+      top: '100%',
+      left: 0,
+      right: 0,
+      background: 'var(--navy2)',
+      border: '1px solid var(--border)',
+      borderRadius: 8,
+      marginTop: 4,
+      maxHeight: 200,
+      overflowY: 'auto',
+      boxShadow: '0 8px 24px rgba(0,0,0,0.5)'
+    }
+  }, siblingMatches.map(s => /*#__PURE__*/React.createElement("div", {
+    key: s.id,
+    onClick: () => {
+      set('siblingIds', [...siblingIds, s.id]);
+      setSiblingSearch('');
+    },
+    style: {
+      padding: '8px 12px',
+      cursor: 'pointer',
+      borderBottom: '1px solid var(--border)',
+      fontSize: '0.82rem'
+    }
+  }, s.name, " ", /*#__PURE__*/React.createElement("span", {
+    className: "fc-text2 fs-sm"
+  }, "(", s.grade, s.parent ? ` · ${s.parent}` : '', ")"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '0.7rem',
+      textTransform: 'uppercase',
+      letterSpacing: '1.5px',
+      color: 'var(--text2)',
+      fontWeight: 600,
+      marginBottom: 10
+    }
   }, "\uD83D\uDE8C Transport"), /*#__PURE__*/React.createElement("div", {
     className: "form-grid",
     style: {
@@ -4768,6 +4865,42 @@ function StudentForm({
       flex: 'none'
     }
   }, f === 'None' ? '❌' : f === 'Tea' ? '☕' : f === 'Snack' ? '🍪' : f === 'Lunch' ? '🍽️' : f === 'Tea + Lunch' ? '☕🍽️' : '🍪🍽️', " ", f))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '0.7rem',
+      textTransform: 'uppercase',
+      letterSpacing: '1.5px',
+      color: 'var(--text2)',
+      fontWeight: 600,
+      marginBottom: 10
+    }
+  }, "\uD83C\uDFE5 Health"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "form-group",
+    style: { marginBottom: form.hasHealthCondition ? 10 : 0 }
+  }, /*#__PURE__*/React.createElement("label", null, "Does this student have a health condition, allergy, or medical need staff should know about?"), /*#__PURE__*/React.createElement("div", {
+    style: { display: 'flex', gap: 8 }
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: `btn btn-sm ${!form.hasHealthCondition ? 'btn-teal' : 'btn-outline'}`,
+    onClick: () => setForm(p => ({ ...p, hasHealthCondition: false, healthCondition: '' })),
+    style: { minWidth: 80, justifyContent: 'center' }
+  }, "No"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: `btn btn-sm ${form.hasHealthCondition ? 'btn-rose' : 'btn-outline'}`,
+    onClick: () => set('hasHealthCondition', true),
+    style: { minWidth: 80, justifyContent: 'center' }
+  }, "Yes"))), form.hasHealthCondition && /*#__PURE__*/React.createElement("div", {
+    className: "form-group"
+  }, /*#__PURE__*/React.createElement("label", null, "Please specify"), /*#__PURE__*/React.createElement("textarea", {
+    value: form.healthCondition,
+    onChange: e => set('healthCondition', e.target.value),
+    placeholder: "e.g. Asthma — carries an inhaler; Peanut allergy — no nuts at all; Epilepsy — call parent immediately if a seizure occurs",
+    rows: 3,
+    style: { width: '100%', resize: 'vertical' }
+  }))), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-8"
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn btn-gold",
@@ -4787,8 +4920,10 @@ function Students({
   fees = [],
   setFees,
   setReceipt,
-  session
+  session,
+  feeTerm
 }) {
+  const activeTerm = feeTerm?.term || null;
   const [search, setSearch] = useState('');
   const [levelFilter, setLevelFilter] = useState('');
   const [gradeFilter, setGradeFilter] = useState('');
@@ -4800,9 +4935,16 @@ function Students({
   const [profileTab, setProfileTab] = useState('info');
   const [showFeeForm, setShowFeeForm] = useState(false);
   const [feeForm, setFeeForm] = useState({
-    term: CURRENT_TERM,
+    term: activeTerm || TERM_OPTIONS[0],
     amount: '8500',
     paid: '',
+    method: 'M-Pesa',
+    ref: '',
+    date: today()
+  });
+  const [showFamilyPayment, setShowFamilyPayment] = useState(false);
+  const [famForm, setFamForm] = useState({
+    amount: '',
     method: 'M-Pesa',
     ref: '',
     date: today()
@@ -5128,13 +5270,14 @@ function Students({
       showToast('Name and parent are required', 'rose');
       return;
     }
-    setStudents(p => [...p, {
+    const newId = 'S' + uid();
+    setStudents(p => syncSiblingLinks([...p, {
       ...form,
-      id: 'S' + uid(),
+      id: newId,
       alumni: false,
       prevGrade: null,
       transport: form.transportMode !== 'Walking'
-    }]);
+    }], newId, [], form.siblingIds || []));
     setShowForm(false);
     showToast('Student registered!');
   };
@@ -5143,17 +5286,21 @@ function Students({
       showToast('Name and parent are required', 'rose');
       return;
     }
-    setStudents(p => p.map(s => s.id === editId ? {
+    const oldSiblingIds = editStudent?.siblingIds || [];
+    const newSiblingIds = form.siblingIds || [];
+    setStudents(p => syncSiblingLinks(p.map(s => s.id === editId ? {
       ...s,
       ...form,
       transport: form.transportMode !== 'Walking'
-    } : s));
+    } : s), editId, oldSiblingIds, newSiblingIds));
     setEditId(null);
     showToast('Student updated!');
   };
   const del = id => {
     if (!confirm('Permanently remove this student?')) return;
-    const ns = students.filter(s => s.id !== id);
+    const ns = students.filter(s => s.id !== id).map(s =>
+      (s.siblingIds || []).includes(id) ? { ...s, siblingIds: s.siblingIds.filter(x => x !== id) } : s
+    );
     setStudents(() => ns);
     schedulePush();
     setViewId(null);
@@ -5313,13 +5460,16 @@ function Students({
     initial: BLANK_STUDENT,
     onSave: saveNew,
     onCancel: () => setShowForm(false),
-    routes: routes
+    routes: routes,
+    students: students
   }), editId && editStudent && /*#__PURE__*/React.createElement(StudentForm, {
     title: `Edit — ${editStudent.name}`,
     initial: editStudent,
     onSave: saveEdit,
     onCancel: () => setEditId(null),
-    routes: routes
+    routes: routes,
+    students: students,
+    currentId: editId
   }), /*#__PURE__*/React.createElement("div", {
     className: "card desktop-only"
   }, /*#__PURE__*/React.createElement("div", {
@@ -5340,7 +5490,10 @@ function Students({
     className: "mono fs-sm fc-text2"
   }, s.id), /*#__PURE__*/React.createElement("td", {
     className: "fw6"
-  }, s.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+  }, s.name, s.hasHealthCondition && /*#__PURE__*/React.createElement("span", {
+    title: s.healthCondition || 'Health condition on file',
+    style: { marginLeft: 6 }
+  }, "\uD83C\uDFE5")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
     className: `badge badge-${LEVEL_COLOR[GRADE_LEVEL[s.grade]] || 'teal'}`
   }, s.grade), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -5402,7 +5555,10 @@ function Students({
     style: {
       fontSize: '0.95rem'
     }
-  }, s.name), /*#__PURE__*/React.createElement("div", {
+  }, s.name, s.hasHealthCondition && /*#__PURE__*/React.createElement("span", {
+    title: s.healthCondition || 'Health condition on file',
+    style: { marginLeft: 6 }
+  }, "\uD83C\uDFE5")), /*#__PURE__*/React.createElement("div", {
     className: "fc-text2 fs-sm"
   }, s.id, " \xB7 ", s.parent)), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -5775,7 +5931,10 @@ function Students({
     className: `badge badge-${LEVEL_COLOR[GRADE_LEVEL[viewStudent.grade]] || 'teal'}`
   }, viewStudent.grade), /*#__PURE__*/React.createElement("span", {
     className: "badge badge-text2"
-  }, LEVEL_ICON[GRADE_LEVEL[viewStudent.grade]], " ", GRADE_LEVEL[viewStudent.grade])))), /*#__PURE__*/React.createElement("div", {
+  }, LEVEL_ICON[GRADE_LEVEL[viewStudent.grade]], " ", GRADE_LEVEL[viewStudent.grade]), viewStudent.hasHealthCondition && /*#__PURE__*/React.createElement("span", {
+    className: "badge badge-rose",
+    title: viewStudent.healthCondition || 'Health condition on file'
+  }, "\uD83C\uDFE5 Health condition")))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       borderBottom: '1px solid var(--border)',
@@ -5907,7 +6066,28 @@ function Students({
     style: {
       fontSize: '0.85rem'
     }
-  }, feedingIcon(viewStudent.feeding || 'None'), " ", viewStudent.feeding || 'None')))), profileTab === 'exams' && (() => {
+  }, feedingIcon(viewStudent.feeding || 'None'), " ", viewStudent.feeding || 'None')), viewStudent.hasHealthCondition && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: 'rgba(224,93,111,0.1)',
+      border: '1px solid rgba(224,93,111,0.3)',
+      borderRadius: 8,
+      padding: '12px 14px',
+      gridColumn: '1 / -1'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fc-text2",
+    style: {
+      fontSize: '0.68rem',
+      textTransform: 'uppercase',
+      letterSpacing: '1px',
+      fontWeight: 600,
+      marginBottom: 6,
+      color: 'var(--rose)'
+    }
+  }, "\uD83C\uDFE5 Health Condition"), /*#__PURE__*/React.createElement("div", {
+    className: "fs-sm",
+    style: { whiteSpace: 'pre-wrap' }
+  }, viewStudent.healthCondition || 'Marked as having a health condition — no detail specified.')))), profileTab === 'exams' && (() => {
     const studentExams = exams.filter(e => e.studentId === viewStudent.id).sort((a, b) => `${b.year}${b.term}` > `${a.year}${a.term}` ? 1 : -1);
     const lvl = GRADE_LEVEL[viewStudent.grade];
     const marksMode = useMarks(viewStudent.grade);
@@ -6700,6 +6880,67 @@ function Students({
     const studentFees = fees.filter(f => f.studentId === viewStudent.id).sort((a, b) => b.date > a.date ? 1 : -1);
     const totalPaid = studentFees.reduce((a, f) => a + f.paid, 0);
     const totalDue = studentFees.reduce((a, f) => a + (f.amount - f.paid), 0);
+    // Only the locked active term (to start a new charge) and terms this student
+    // already has a record for (to keep collecting toward an old balance) are
+    // selectable here — an arbitrary/future term can't be billed to ad hoc.
+    const billableTerms = (() => {
+      const set = Array.from(new Set([activeTerm, ...studentFees.map(f => f.term)].filter(Boolean)));
+      return set.length ? set : [TERM_OPTIONS[0]];
+    })();
+    // Siblings linked to this student, with each one's overall balance — used both
+    // for the "Family" summary card and for splitting a lump-sum payment below.
+    const familyMembers = (viewStudent.siblingIds || []).map(id => students.find(s => s.id === id)).filter(Boolean);
+    const familyBalance = m => fees.filter(f => f.studentId === m.id).reduce((a, f) => a + Math.max(0, f.amount - f.paid), 0);
+    const familyTotalDue = familyMembers.reduce((a, m) => a + familyBalance(m), totalDue);
+    const recordFamilyPayment = () => {
+      const amt = parseFloat(famForm.amount);
+      if (isNaN(amt) || amt <= 0) { showToast('Enter a valid amount', 'rose'); return; }
+      const famRef = famForm.ref || 'FAM' + uid();
+      let remaining = amt;
+      setFees(prev => {
+        let next = [...prev];
+        [viewStudent, ...familyMembers].forEach(member => {
+          if (remaining <= 0) return;
+          let rec = next.find(f => f.studentId === member.id && f.term === activeTerm);
+          if (!rec) {
+            rec = {
+              id: 'F' + uid(),
+              studentId: member.id,
+              term: activeTerm || TERM_OPTIONS[0],
+              amount: 8500,
+              paid: 0,
+              status: 'pending',
+              method: famForm.method,
+              ref: '',
+              date: famForm.date || today(),
+              paymentHistory: []
+            };
+            next.push(rec);
+          }
+          const bal = Math.max(0, (parseFloat(rec.amount) || 0) - (parseFloat(rec.paid) || 0));
+          if (bal <= 0) return;
+          const applied = Math.min(bal, remaining);
+          remaining -= applied;
+          next = next.map(f => f.id === rec.id ? {
+            ...f,
+            paid: (parseFloat(f.paid) || 0) + applied,
+            status: ((parseFloat(f.paid) || 0) + applied) >= (parseFloat(f.amount) || 0) ? 'paid' : 'partial',
+            paymentHistory: [...(f.paymentHistory || []), {
+              date: famForm.date || today(),
+              amount: applied,
+              method: famForm.method,
+              ref: famRef
+            }]
+          } : f);
+        });
+        return next;
+      });
+      setShowFamilyPayment(false);
+      setFamForm({ amount: '', method: 'M-Pesa', ref: '', date: today() });
+      showToast(remaining > 0
+        ? `✅ Family payment recorded — KES ${remaining.toLocaleString()} was left over after every balance was cleared.`
+        : `✅ KES ${amt.toLocaleString()} split across the family and recorded — ${activeTerm || 'active term'}.`, 'green', 6000);
+    };
     const saveFee = () => {
       if (!feeForm.paid) {
         showToast('Enter amount paid', 'rose');
@@ -6740,7 +6981,7 @@ function Students({
       });
       setShowFeeForm(false);
       setFeeForm({
-        term: CURRENT_TERM,
+        term: activeTerm || TERM_OPTIONS[0],
         amount: '8500',
         paid: '',
         method: 'M-Pesa',
@@ -6804,7 +7045,68 @@ function Students({
         color: totalDue > 0 ? 'var(--rose)' : 'var(--green)',
         fontFamily: 'JetBrains Mono'
       }
-    }, fmt(totalDue)))), !showFeeForm && /*#__PURE__*/React.createElement("button", {
+    }, fmt(totalDue)))), familyMembers.length > 0 && /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: 'rgba(20,184,166,0.08)',
+        border: '1px solid rgba(20,184,166,0.25)',
+        borderRadius: 9,
+        padding: '12px 14px',
+        marginBottom: 14
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: { fontWeight: 700, fontSize: '0.8rem', marginBottom: 8 }
+    }, "\uD83D\uDC6A Family"), familyMembers.map(m => /*#__PURE__*/React.createElement("div", {
+      key: m.id,
+      style: { display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem', padding: '3px 0' }
+    }, /*#__PURE__*/React.createElement("span", null, m.name, " ", /*#__PURE__*/React.createElement("span", { className: "fc-text2" }, "(", m.grade, ")")), /*#__PURE__*/React.createElement("span", {
+      style: { color: familyBalance(m) > 0 ? 'var(--rose)' : 'var(--green)', fontFamily: 'JetBrains Mono' }
+    }, fmt(familyBalance(m))))), /*#__PURE__*/React.createElement("div", {
+      style: { display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', fontWeight: 700, paddingTop: 6, marginTop: 4, borderTop: '1px solid var(--border)' }
+    }, /*#__PURE__*/React.createElement("span", null, "Combined balance"), /*#__PURE__*/React.createElement("span", {
+      style: { color: familyTotalDue > 0 ? 'var(--rose)' : 'var(--green)', fontFamily: 'JetBrains Mono' }
+    }, fmt(familyTotalDue))), !showFamilyPayment && /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-teal btn-sm",
+      style: { width: '100%', marginTop: 10, justifyContent: 'center' },
+      onClick: () => setShowFamilyPayment(true)
+    }, "\uD83D\uDC6A Record Family Payment"), showFamilyPayment && /*#__PURE__*/React.createElement("div", {
+      style: { marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "fs-sm fc-text2",
+      style: { marginBottom: 8 }
+    }, "One lump sum, applied to ", activeTerm || 'the active term', " \u2014 ", viewStudent.name, " first, then each sibling, oldest balance first. Nothing is applied past what each person actually owes."), /*#__PURE__*/React.createElement("div", {
+      style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: { fontSize: '0.68rem', color: 'var(--text2)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.8px', display: 'block', marginBottom: 4 }
+    }, "Amount (KES)"), /*#__PURE__*/React.createElement("input", {
+      type: "number",
+      value: famForm.amount,
+      onChange: e => setFamForm(p => ({ ...p, amount: e.target.value }))
+    })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: { fontSize: '0.68rem', color: 'var(--text2)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.8px', display: 'block', marginBottom: 4 }
+    }, "Method"), /*#__PURE__*/React.createElement("select", {
+      value: famForm.method,
+      onChange: e => setFamForm(p => ({ ...p, method: e.target.value }))
+    }, ['M-Pesa', 'Bank Transfer', 'Cash', 'Cheque'].map(m => /*#__PURE__*/React.createElement("option", { key: m }, m)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: { fontSize: '0.68rem', color: 'var(--text2)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.8px', display: 'block', marginBottom: 4 }
+    }, "Reference No."), /*#__PURE__*/React.createElement("input", {
+      value: famForm.ref,
+      onChange: e => setFamForm(p => ({ ...p, ref: e.target.value })),
+      placeholder: "auto-generated if blank"
+    })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+      style: { fontSize: '0.68rem', color: 'var(--text2)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.8px', display: 'block', marginBottom: 4 }
+    }, "Date"), /*#__PURE__*/React.createElement("input", {
+      type: "date",
+      value: famForm.date,
+      onChange: e => setFamForm(p => ({ ...p, date: e.target.value }))
+    }))), /*#__PURE__*/React.createElement("div", {
+      className: "flex gap-8"
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-teal",
+      onClick: recordFamilyPayment
+    }, "\uD83D\uDCBE Save Family Payment"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-outline",
+      onClick: () => setShowFamilyPayment(false)
+    }, "Cancel")))), !showFeeForm && /*#__PURE__*/React.createElement("button", {
       className: "btn btn-gold",
       style: {
         width: '100%',
@@ -6848,7 +7150,7 @@ function Students({
         ...p,
         term: e.target.value
       }))
-    }, TERM_OPTIONS.map(t => /*#__PURE__*/React.createElement("option", {
+    }, (billableTerms).map(t => /*#__PURE__*/React.createElement("option", {
       key: t
     }, t)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
       style: {
@@ -7386,6 +7688,23 @@ function Fees({
   const [bulkGrade, setBulkGrade] = useState('all');
   const [bulkAmount, setBulkAmount] = useState('8500');
   const [editId, setEditId] = useState(null);
+  const [carryForward, setCarryForward] = useState(false);
+  // Money the selected student owes from any term OTHER than the one being billed —
+  // this is what the "carry forward" checkbox below offers to add onto this term's total.
+  const priorBalance = !editId && form.studentId
+    ? fees.filter(f => f.studentId === form.studentId && f.term !== activeTerm)
+        .reduce((a, f) => a + Math.max(0, f.amount - f.paid), 0)
+    : 0;
+  const toggleCarryForward = () => {
+    setCarryForward(v => {
+      const next = !v;
+      setForm(p => {
+        const cur = parseFloat(p.amount) || 0;
+        return { ...p, amount: String(Math.max(0, next ? cur + priorBalance : cur - priorBalance)) };
+      });
+      return next;
+    });
+  };
   const startEdit = f => {
     setEditId(f.id);
     const student = students.find(s => s.id === f.studentId);
@@ -7480,6 +7799,7 @@ function Fees({
       });
       setStudentSearch('');
       setStudentDropOpen(false);
+      setCarryForward(false);
       showToast('✅ Fee record updated');
       setSaving(false);
       return;
@@ -7513,6 +7833,32 @@ function Fees({
       }]);
     }
 
+    // Carrying a prior-term deficit forward means it's now baked into this term's
+    // Total Amount (the checkbox already added it to form.amount before saving), so
+    // the old term record(s) need to be marked settled — otherwise that same debt
+    // would still show as outstanding there AND be double-counted in this term.
+    // We don't delete the history; we close it out with a clearly-labelled
+    // "Carried Forward" entry so it stays auditable.
+    if (carryForward && priorBalance > 0) {
+      setFees(prev => prev.map(f => {
+        if (f.studentId !== form.studentId || f.term === form.term) return f;
+        const bal = (parseFloat(f.amount) || 0) - (parseFloat(f.paid) || 0);
+        if (bal <= 0) return f;
+        return {
+          ...f,
+          paid: f.amount,
+          status: 'paid',
+          paymentHistory: [...(f.paymentHistory || []), {
+            date: form.date || today(),
+            amount: bal,
+            method: 'Carried Forward',
+            ref: `Carried to ${form.term}`
+          }]
+        };
+      }));
+      successMsg += ` KES ${priorBalance.toLocaleString()} carried forward from earlier terms.`;
+    }
+
     setShowForm(false);
     setForm({
       studentId: '',
@@ -7525,6 +7871,7 @@ function Fees({
     });
     setStudentSearch('');
     setStudentDropOpen(false);
+    setCarryForward(false);
     showToast(successMsg, 'green', 5000);
     setSaving(false);
   };
@@ -7716,6 +8063,7 @@ function Fees({
           ...p,
           studentId: s.id
         }));
+        setCarryForward(false);
         setStudentSearch(`${s.name} (${s.grade})`);
         setStudentDropOpen(false);
       },
@@ -7748,7 +8096,7 @@ function Fees({
     }
   }, "\u2705 ", students.find(s => s.id === form.studentId)?.name)), /*#__PURE__*/React.createElement("div", {
     className: "form-group"
-  }, /*#__PURE__*/React.createElement("label", null, "Term"), /*#__PURE__*/React.createElement("select", {
+  }, /*#__PURE__*/React.createElement("label", null, "Term"), editId ? /*#__PURE__*/React.createElement("select", {
     value: form.term,
     onChange: e => setForm(p => ({
       ...p,
@@ -7756,7 +8104,28 @@ function Fees({
     }))
   }, TERM_OPTIONS.map(t => /*#__PURE__*/React.createElement("option", {
     key: t
-  }, t)))), /*#__PURE__*/React.createElement("div", {
+  }, t))) : /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: activeTerm || 'No active term set',
+    disabled: true,
+    title: "New payments use the locked active term for Fees",
+    style: { opacity: 0.75 }
+  })), !editId && priorBalance > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: '1 / -1',
+      background: 'rgba(240,165,0,0.08)',
+      border: '1px solid rgba(240,165,0,0.3)',
+      borderRadius: 8,
+      padding: '10px 14px',
+      fontSize: '0.78rem'
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: carryForward,
+    onChange: toggleCarryForward
+  }), "\u26A0\uFE0F This student owes KES ", priorBalance.toLocaleString(), " from other terms \u2014 add it to this term's Total Amount")), /*#__PURE__*/React.createElement("div", {
     className: "form-group"
   }, /*#__PURE__*/React.createElement("label", null, "Total Amount (KES)"), /*#__PURE__*/React.createElement("input", {
     type: "number",
@@ -10507,10 +10876,7 @@ function Messaging({
     if (form.recipients === 'all') return students;
     if (form.recipients === 'grade') return students.filter(s => s.grade === form.gradeFilter);
     if (form.recipients === 'transport') return students.filter(s => s.transportMode === 'One-Way' || s.transportMode === 'Two-Way');
-    if (form.recipients === 'debtors') return students.filter(s => {
-      const f = fees.find(ff => ff.studentId === s.id);
-      return f && f.paid < f.amount;
-    });
+    if (form.recipients === 'debtors') return students.filter(s => studentFeeBalance(fees, s.id) > 0);
     if (form.recipients === 'selected') return students.filter(s => form.selectedIds.includes(s.id));
     return students;
   };
@@ -10528,8 +10894,7 @@ function Messaging({
     };
   }, [recipients, fees, form.body, feeDueDate]);
   const personalise = (text, student) => {
-    const feeRec = fees.find(f => f.studentId === student.id);
-    const balance = feeRec ? feeRec.amount - feeRec.paid : 0;
+    const balance = studentFeeBalance(fees, student.id);
     const dueText = feeDueDate ? fmtDate(feeDueDate) : '[due date not set — check Messaging settings]';
     return text.replace(/{parent}/g, student.parent).replace(/{student}/g, student.name).replace(/{grade}/g, student.grade).replace(/{term}/g, CURRENT_TERM).replace(/{balance}/g, 'KES ' + balance.toLocaleString()).replace(/{due_date}/g, dueText);
   };
@@ -13485,6 +13850,46 @@ ReactDOM.render(/*#__PURE__*/React.createElement(ErrorBoundary, null, /*#__PURE_
   // Hide banner if already running as standalone (installed)
   if (window.matchMedia('(display-mode: standalone)').matches) {
     console.log('[PWA] Running as installed app.');
+  }
+
+  // ── iOS install instructions ──
+  // Safari never fires beforeinstallprompt, so without this, iPhone/iPad users get
+  // no install prompt at all — the only path is the manual Share ▸ Add to Home
+  // Screen, which most people never discover on their own.
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+  var isStandalone = window.navigator.standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches;
+
+  if (isIOS && !isStandalone && !sessionStorage.getItem('tvsa_ios_banner_dismissed')) {
+    setTimeout(function() {
+      var banner = document.createElement('div');
+      banner.id = 'pwa-ios-banner';
+      banner.innerHTML =
+        '<div style="display:flex;align-items:center;gap:12px;max-width:420px;margin:0 auto">' +
+        '<img src="/icons/icon-72.png" style="width:40px;height:40px;border-radius:8px" alt="TVSA">' +
+        '<div style="flex:1"><strong style="display:block;font-size:0.9rem">Install TVS EduTrack</strong>' +
+        '<span style="font-size:0.78rem;opacity:0.8">Tap the Share icon' +
+        ' <svg width="13" height="16" viewBox="0 0 24 28" style="vertical-align:-2px" fill="currentColor"><path d="M12 0l6 6h-4v12h-4V6H6l6-6zM3 12h4v2H4v12h16V14h-4v-2h6v16H3V12z"/></svg>' +
+        ', then "Add to Home Screen"</span></div>' +
+        '<button id="pwa-ios-dismiss-btn" style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.3);border-radius:8px;padding:8px 10px;cursor:pointer;font-size:0.82rem">✕</button>' +
+        '</div>';
+      banner.style.cssText =
+        'position:fixed;bottom:0;left:0;right:0;background:#1e2f47;color:#fff;' +
+        'padding:14px 16px;padding-bottom:calc(14px + env(safe-area-inset-bottom, 0px));' +
+        'z-index:9999;font-family:DM Sans,sans-serif;' +
+        'box-shadow:0 -4px 20px rgba(0,0,0,0.5);border-top:1px solid rgba(240,165,0,0.3);' +
+        'animation:slideUp 0.3s ease;';
+
+      var style = document.createElement('style');
+      style.textContent = '@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}';
+      document.head.appendChild(style);
+      document.body.appendChild(banner);
+
+      document.getElementById('pwa-ios-dismiss-btn').addEventListener('click', function() {
+        banner.remove();
+        sessionStorage.setItem('tvsa_ios_banner_dismissed', '1');
+      });
+    }, 5000);
   }
 })();
 </script>
